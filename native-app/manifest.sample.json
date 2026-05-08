@@ -1,0 +1,9 @@
+{
+  "name": "ll_integration_native",
+  "description": "LL Integration Native App",
+  "path": "C:\\Path\\To\\LLIntegration\\native-app\\run.bat",
+  "type": "stdio",
+  "allowed_extensions": [
+    "ll-integration@nm088.dev"
+  ]
+}

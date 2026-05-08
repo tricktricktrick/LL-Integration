@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LL Integration Downloads",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "sourceUrl": {
+      "type": "string"
+    },
+    "fetchedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "downloads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "size": {
+            "type": ["string", "null"]
+          },
+          "date_iso": {
+            "type": ["string", "null"]
+          },
+          "version": {
+            "type": ["string", "null"]
+          }
+        },
+        "required": ["name", "url", "size", "date_iso", "version"]
+      }
+    }
+  },
+  "required": ["sourceUrl", "fetchedAt", "downloads"]
+}

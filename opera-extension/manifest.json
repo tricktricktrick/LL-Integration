@@ -1,0 +1,46 @@
+{
+    "manifest_version": 3,
+    "name": "LL Integration",
+    "version": "0.1",
+    "description": "Bridge LoversLab and external archive downloads into Mod Organizer 2.",
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7tjUle1vegu+NWyvjfgACOtur+3ndFOrGXDP2sUPPRxef1UEziSwIIRd8U9mE1b70KWaBlJLOG3JOEGrqRVNzkkZUgTIJ5Vd6PcD2Rd+24YcA7DlNwYPUpXbydk1Q2HMSvmlikcyC64wIotLPpno/+rMZ7tp51hwOgS0Dj9iTtyFBKWovkvTe2OUWmDNXKbrA4mwYLGkFN1JwLvzaYMzZ4BVlEFWr3b29lPrjthSaAF7jqO4KeHqn8wQBRmF54V7WKl5/+nvXUTnkjG3SlplXJ/ODwqAethGhiqQE6DWRAeCBxd/Lt7sUwiS8uitF8ne6LqGR2F+u4ydHGIYRcviRwIDAQAB",
+    "icons": {
+        "16": "icons/ll_integration_16.png",
+        "32": "icons/ll_integration_32.png",
+        "48": "icons/ll_integration_48.png",
+        "96": "icons/ll_integration_96.png",
+        "128": "icons/ll_integration_128.png"
+    },
+    "permissions": [
+        "cookies",
+        "downloads",
+        "nativeMessaging",
+        "activeTab",
+        "tabs",
+        "storage"
+    ],
+    "host_permissions": [
+        "https://www.loverslab.com/*",
+        "https://loverslab.com/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://www.loverslab.com/*",
+                "https://loverslab.com/*"
+            ],
+            "js": ["content.js"]
+        }
+    ],
+    "action": {
+        "default_title": "LL Integration",
+        "default_icon": {
+            "16": "icons/ll_integration_16.png",
+            "32": "icons/ll_integration_32.png"
+        },
+        "default_popup": "popup.html"
+    }
+}

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local/runtime native app data
+native-app/config.json
+native-app/manifest.json
+native-app/run.bat
+native-app/ll_integration_native.exe
+native-app/cookies_storage/
+native-app/downloads_storage/
+native-app/metadata/
+
+# MO2 plugin runtime output
+mo2-plugin/update_check.json
+mo2-plugin/downloads_ll.json
+mo2-plugin/pama_check.json
+mo2-plugin/fetch_update_timings.jsonl
+mo2-plugin/fetch_pacing.json
+mo2-plugin/update_cache.json
+mo2-plugin/experimental_toolbar.log
+mo2-plugin/plugin_paths.json
+
+# LoversLab/source metadata sidecars
+*.ll.ini
+*.ll.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.purged.bak
+
+# Local installer/build outputs
+dist/
+build/
+*.spec
+*.xpi
+*.zip

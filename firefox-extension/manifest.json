@@ -1,0 +1,50 @@
+{
+    "manifest_version": 2,
+    "name": "LL Integration",
+    "version": "0.1",
+    "icons": {
+        "32": "icons/ll_integration.svg",
+        "48": "icons/ll_integration.svg",
+        "96": "icons/ll_integration.svg"
+    },
+    "permissions": [
+        "cookies",
+        "downloads",
+        "nativeMessaging",
+        "activeTab",
+        "tabs",
+        "https://www.loverslab.com/*",
+        "https://loverslab.com/*"
+    ],
+    "background": {
+        "scripts": ["background.js"]
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://www.loverslab.com/*",
+                "https://loverslab.com/*"
+            ],
+            "js": ["content.js"]
+        }
+    ],
+    "browser_action": {
+        "default_title": "LL Integration",
+        "default_icon": {
+            "16": "icons/ll_integration.svg",
+            "32": "icons/ll_integration.svg"
+        },
+        "default_popup": "popup.html"
+    },
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "ll-integration@nm088.dev",
+            "data_collection_permissions": {
+                "required": [
+                    "authenticationInfo",
+                    "websiteActivity"
+                ]
+            }
+        }
+    }
+}

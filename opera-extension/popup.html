@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="mark">LL</div>
+        <div>
+          <h1>LL Integration</h1>
+          <p id="readyText">Checking status...</p>
+        </div>
+      </header>
+
+      <section class="status-list">
+        <div class="status" id="nativeStatus">
+          <span class="dot"></span>
+          <div>
+            <strong>Native bridge</strong>
+            <small>Not checked</small>
+          </div>
+        </div>
+        <div class="status" id="mo2Status">
+          <span class="dot"></span>
+          <div>
+            <strong>MO2 plugin</strong>
+            <small>Not checked</small>
+          </div>
+        </div>
+        <div class="status" id="downloadsStatus">
+          <span class="dot"></span>
+          <div>
+            <strong>MO2 downloads</strong>
+            <small>Not checked</small>
+          </div>
+        </div>
+        <div class="status" id="cookiesStatus">
+          <span class="dot"></span>
+          <div>
+            <strong>LoversLab cookies</strong>
+            <small>Not checked</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="refreshButton" type="button">Check Status</button>
+        <button id="exportButton" type="button">Export Cookies</button>
+      </section>
+      <section class="actions capture-actions">
+        <button id="captureButton" type="button">Capture Archives From This Page</button>
+        <button id="cancelButton" type="button">Cancel Capture</button>
+      </section>
+
+      <p id="message" class="message"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
