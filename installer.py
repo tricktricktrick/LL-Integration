@@ -10,7 +10,10 @@ from tkinter import filedialog, messagebox
 
 APP_NAME = "LLIntegration"
 NATIVE_NAME = "ll_integration_native"
-FIREFOX_EXTENSION_ID = "ll-integration@nm088.dev"
+FIREFOX_EXTENSION_IDS = [
+    "ll-integration-firefox@nm088.dev",
+    "ll-integration@nm088.dev",
+]
 CHROMIUM_EXTENSION_ID = "ndnmgkboipaepgndebnikcnicechokln"
 CHROMIUM_EXTENSION_ORIGIN = f"chrome-extension://{CHROMIUM_EXTENSION_ID}/"
 FIREFOX_NATIVE_HOST_KEYS = [
@@ -384,7 +387,7 @@ class InstallerApp(tk.Tk):
             "description": "LL Integration Native App",
             "path": str(native_launch_path),
             "type": "stdio",
-            "allowed_extensions": [FIREFOX_EXTENSION_ID],
+            "allowed_extensions": FIREFOX_EXTENSION_IDS,
         }
         firefox_manifest_text = json.dumps(firefox_manifest, indent=2)
         (NATIVE_TARGET / "manifest.json").write_text(firefox_manifest_text, encoding="utf-8")

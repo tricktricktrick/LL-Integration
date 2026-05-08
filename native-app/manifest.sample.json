@@ -4,6 +4,7 @@
   "path": "C:\\Path\\To\\LLIntegration\\native-app\\run.bat",
   "type": "stdio",
   "allowed_extensions": [
+    "ll-integration-firefox@nm088.dev",
     "ll-integration@nm088.dev"
   ]
 }

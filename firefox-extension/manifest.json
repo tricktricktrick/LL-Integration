@@ -1,11 +1,13 @@
 {
     "manifest_version": 2,
     "name": "LL Integration",
-    "version": "0.1",
+    "version": "0.1.1",
     "icons": {
-        "32": "icons/ll_integration.svg",
-        "48": "icons/ll_integration.svg",
-        "96": "icons/ll_integration.svg"
+        "16": "icons/ll_integration_16.png",
+        "32": "icons/ll_integration_32.png",
+        "48": "icons/ll_integration_48.png",
+        "96": "icons/ll_integration_96.png",
+        "128": "icons/ll_integration_128.png"
     },
     "permissions": [
         "cookies",
@@ -31,14 +33,14 @@
     "browser_action": {
         "default_title": "LL Integration",
         "default_icon": {
-            "16": "icons/ll_integration.svg",
-            "32": "icons/ll_integration.svg"
+            "16": "icons/ll_integration_16.png",
+            "32": "icons/ll_integration_32.png"
         },
         "default_popup": "popup.html"
     },
     "browser_specific_settings": {
         "gecko": {
-            "id": "ll-integration@nm088.dev",
+            "id": "ll-integration-firefox@nm088.dev",
             "data_collection_permissions": {
                 "required": [
                     "authenticationInfo",
