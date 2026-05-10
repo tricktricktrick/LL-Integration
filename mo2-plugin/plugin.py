@@ -5,14 +5,17 @@ import shutil
 import time
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.request import Request, urlopen
 import webbrowser
 
 import mobase
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QGridLayout,
@@ -33,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .check_update import DEFAULT_COOKIES, check_ini_for_updates, choose_latest, with_query_value
-from .utils import archive_quick_hash, extract_downloads, fetch_ll_html, load_ll_cookies
+from .utils import archive_quick_hash, compare_versions, cookie_header, extract_downloads, fetch_ll_html, load_ll_cookies
 
 
 PLUGIN_NAME = "LL Integration"
@@ -49,6 +52,154 @@ UPDATE_CACHE_VERSION = 1
 LL_SECTION = "LoversLab"
 MOD_META_FILE = "meta.ini"
 LEGACY_MOD_LL_FILE = "LL.ini"
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+UPDATE_MODE_MANUAL = "manual"
+UPDATE_MODE_DOWNLOAD_ONLY = "download_only"
+UPDATE_MODE_ASSISTED = "assisted"
+UPDATE_MODE_AUTOMATIC = "automatic"
+UPDATE_MODE_SKIP = "skip"
+UPDATE_MODE_OPTIONS = [
+    (UPDATE_MODE_MANUAL, "Manual install", True),
+    (UPDATE_MODE_DOWNLOAD_ONLY, "Download only", True),
+    (UPDATE_MODE_ASSISTED, "Assisted install", True),
+    (UPDATE_MODE_AUTOMATIC, "Automatic install (experimental, coming later)", False),
+    (UPDATE_MODE_SKIP, "Skip updates", True),
+]
+UPDATE_MODE_LABELS = {value: label for value, label, _enabled in UPDATE_MODE_OPTIONS}
+
+
+def normalized_update_mode(value: str | None, fixed: bool = False) -> str:
+    mode = str(value or "").strip().lower()
+    valid = {item[0] for item in UPDATE_MODE_OPTIONS}
+    if mode in valid:
+        return mode
+    return UPDATE_MODE_SKIP if fixed else UPDATE_MODE_MANUAL
+
+
+def update_mode_label(mode: str) -> str:
+    return UPDATE_MODE_LABELS.get(normalized_update_mode(mode), UPDATE_MODE_LABELS[UPDATE_MODE_MANUAL])
+
+
+def configure_update_mode_combo(combo: QComboBox, selected: str) -> None:
+    selected_mode = normalized_update_mode(selected)
+    selected_index = 0
+    for index, (value, label, enabled) in enumerate(UPDATE_MODE_OPTIONS):
+        combo.addItem(label, value)
+        if value == selected_mode:
+            selected_index = index
+        item = combo.model().item(index)
+        if item is not None and not enabled:
+            item.setEnabled(False)
+            item.setToolTip("Placeholder for a future release.")
+    combo.setCurrentIndex(selected_index)
+
+
+def ini_value(value) -> str:
+    return "" if value is None else str(value).replace("\n", " ").replace("\r", " ").strip()
+
+
+def ll_resource_id(download_url: str) -> str:
+    if not download_url:
+        return ""
+    query = parse_qs(urlparse(download_url).query)
+    return (query.get("r") or [""])[0]
+
+
+def safe_archive_name(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(name or "").strip())
+    return cleaned.strip(" .") or "loverslab-download.archive"
+
+
+def download_loverslab_archive(url: str, target: Path, cookies_path: Path, referer: str, timeout: float) -> Path:
+    cookies = load_ll_cookies(cookies_path, required_only=False)
+    if not cookies:
+        raise RuntimeError(f"No usable LoversLab cookies found in {cookies_path}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    headers = {
+        "Cookie": cookie_header(cookies),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+            "Gecko/20100101 Firefox/125.0"
+        ),
+        "Accept": "application/octet-stream,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    temp = target.with_name(f"{target.name}.part")
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request, timeout=timeout) as response, temp.open("wb") as file:
+            while True:
+                chunk = response.read(DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                file.write(chunk)
+        temp.replace(target)
+    except Exception:
+        try:
+            temp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return target
+
+
+def write_update_download_sidecar(
+    ini_path: Path,
+    archive_path: Path,
+    latest: dict,
+    download_url: str,
+) -> Path:
+    source = read_ll_section(ini_path)
+    page_url = source.get("page_url", "").strip()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    archive_hash = archive_quick_hash(archive_path) if archive_path.exists() else ""
+    archive_size = str(archive_path.stat().st_size) if archive_path.exists() else ""
+    ll_id_match = re.search(r"/files/file/(\d+)", page_url)
+    ll_id = ll_id_match.group(1) if ll_id_match else source.get("ll_file_id", "").strip()
+    update_mode = normalized_update_mode(source.get("update_mode"))
+    lines = [
+        "[LoversLab]",
+        "source=loverslab",
+        f"ll_file_id={ini_value(ll_id)}",
+        f"ll_resource_id={ini_value(ll_resource_id(download_url))}",
+        f"page_url={ini_value(page_url)}",
+        f"page_title={ini_value(source.get('page_title', ''))}",
+        f"download_url={ini_value(download_url)}",
+        f"file_name={ini_value(latest.get('name'))}",
+        f"original_archive_name={ini_value(latest.get('name'))}",
+        f"archive_name={ini_value(archive_path.name)}",
+        f"archive_size_bytes={archive_size}",
+        f"archive_quick_hash={archive_hash}",
+        f"version={ini_value(latest.get('version'))}",
+        f"size={ini_value(latest.get('size'))}",
+        f"date_iso={ini_value(latest.get('date_iso'))}",
+        f"captured_at={now}",
+        f"archive_path={ini_value(archive_path)}",
+        f"browser_download_url={ini_value(download_url)}",
+        f"completed_at={now}",
+        f"update_mode={update_mode}",
+        "fixed_version=false",
+        "manual_update=false",
+        "skip_update_check=false",
+        f"multipart={ini_value(source.get('multipart', 'false'))}",
+        f"file_pattern={ini_value(source.get('file_pattern', latest.get('name') or ''))}",
+        "",
+    ]
+    sidecar = Path(f"{archive_path}.ll.ini")
+    sidecar.write_text("\n".join(lines), encoding="utf-8")
+    return sidecar
 
 
 def read_mod_meta_general(mod) -> dict[str, str]:
@@ -202,6 +353,42 @@ def read_ll_section(path: Path) -> configparser.SectionProxy:
     return config[LL_SECTION]
 
 
+def ll_file_id_from_url(url: str) -> str:
+    match = re.search(r"/files/file/(\d+)", str(url or ""))
+    return match.group(1) if match else ""
+
+
+def ll_metadata_identity(section: configparser.SectionProxy) -> str:
+    file_id = section.get("ll_file_id", "").strip()
+    if file_id:
+        return f"file:{file_id}"
+
+    for key in ("page_url", "download_url", "browser_download_url"):
+        file_id = ll_file_id_from_url(section.get(key, ""))
+        if file_id:
+            return f"file:{file_id}"
+
+    page_url = section.get("page_url", "").strip().lower()
+    if page_url:
+        parsed = urlparse(page_url)
+        normalized = parsed._replace(query="", fragment="").geturl().rstrip("/")
+        return f"url:{normalized}"
+
+    return ""
+
+
+def ll_metadata_same_source(left_path: Path, right_path: Path) -> bool:
+    try:
+        left = read_ll_section(left_path)
+        right = read_ll_section(right_path)
+    except Exception:
+        return False
+
+    left_identity = ll_metadata_identity(left)
+    right_identity = ll_metadata_identity(right)
+    return bool(left_identity and right_identity and left_identity == right_identity)
+
+
 def write_mod_ll_metadata_from_file(mod, source_path: Path) -> Path:
     source = read_ini_file(source_path)
     if LL_SECTION not in source:
@@ -235,6 +422,26 @@ def write_mod_ll_metadata_from_section(mod, section: configparser.SectionProxy) 
     legacy = legacy_mod_ll_path(mod)
     if legacy.exists():
         legacy.unlink()
+
+    return meta_path
+
+
+def write_mod_general_source_metadata(mod, page_url: str, version: str) -> Path:
+    meta_path = mod_meta_path(mod)
+    config = read_ini_file(meta_path, preserve_case=True)
+    if "General" not in config:
+        config["General"] = {}
+
+    general = config["General"]
+    if page_url:
+        general["url"] = page_url
+        general["hasCustomURL"] = "true"
+        general["repository"] = "LoversLab"
+    if version:
+        general["version"] = f"{version}.0" if version.count(".") == 2 else version
+
+    with meta_path.open("w", encoding="utf-8") as file:
+        config.write(file, space_around_delimiters=False)
 
     return meta_path
 
@@ -350,7 +557,7 @@ class CheckAllWorker(QObject):
         return (
             Path(str(job.get("ini_path") or "")).exists()
             and not job.get("fixed")
-            and bool(job.get("current"))
+            and bool(job.get("page_url"))
         )
 
     def _sleep_cancelable(self, seconds: float) -> bool:
@@ -381,6 +588,8 @@ class CheckAllWorker(QObject):
                 "latest": "",
                 "file": job.get("file") or "",
                 "page_url": job.get("page_url") or "",
+                "fixed": bool(job.get("fixed")),
+                "update_mode": job.get("update_mode") or "",
                 "info": "LL Integration metadata was removed",
             }
 
@@ -394,20 +603,9 @@ class CheckAllWorker(QObject):
                 "latest": "",
                 "file": job.get("file") or "",
                 "page_url": job.get("page_url") or "",
-                "info": "Fixed/manual link; update fetch skipped",
-            }
-
-        if not job.get("current"):
-            return {
-                "ini_path": job.get("ini_path") or "",
-                "internal_name": job.get("internal_name") or "",
-                "mod": job["mod"],
-                "status": "Untracked",
-                "current": "",
-                "latest": "",
-                "file": job.get("file") or "",
-                "page_url": job.get("page_url") or "",
-                "info": "LL Integration metadata needs version",
+                "fixed": bool(job.get("fixed")),
+                "update_mode": job.get("update_mode") or "",
+                "info": "Skip updates; update fetch skipped",
             }
 
         try:
@@ -415,6 +613,7 @@ class CheckAllWorker(QObject):
             result = check_ini_for_updates(Path(job["ini_path"]), self._cookies_path, timeout=self._request_timeout)
             duration = time.monotonic() - started
             latest = result.get("latest") or {}
+            current = result.get("currentVersion") or ""
             self._log_event({
                 "event": "request",
                 "run_id": self._run_id,
@@ -430,12 +629,21 @@ class CheckAllWorker(QObject):
                 "ini_path": job.get("ini_path") or "",
                 "internal_name": job.get("internal_name") or "",
                 "mod": job["mod"],
-                "status": "Update" if result.get("updateAvailable") else "OK",
-                "current": result.get("currentVersion") or "",
+                "status": "Unknown" if not current else ("Update" if result.get("updateAvailable") else "OK"),
+                "current": current,
                 "latest": latest.get("version") or "",
                 "file": latest.get("name") or result.get("knownFile") or "",
+                "latest_url": latest.get("url") or "",
+                "latest_size": latest.get("size") or "",
+                "latest_date_iso": latest.get("date_iso") or "",
                 "page_url": job.get("page_url") or "",
-                "info": f"Fetched in {duration:.1f}s",
+                "fixed": bool(job.get("fixed")),
+                "update_mode": job.get("update_mode") or "",
+                "info": (
+                    f"Fetched in {duration:.1f}s; current version missing"
+                    if not current
+                    else f"Fetched in {duration:.1f}s"
+                ),
             }
         except Exception as exc:
             duration = time.monotonic() - started if "started" in locals() else 0.0
@@ -460,8 +668,100 @@ class CheckAllWorker(QObject):
                 "latest": "",
                 "file": job.get("file") or "",
                 "page_url": job.get("page_url") or "",
+                "fixed": bool(job.get("fixed")),
+                "update_mode": job.get("update_mode") or "",
                 "info": info,
             }
+
+
+class TryUpdateWorker(QObject):
+    rowReady = pyqtSignal(object)
+    statusChanged = pyqtSignal(str)
+    finished = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        row: dict,
+        cookies_path: Path,
+        downloads_path: Path,
+        request_timeout: float = UPDATE_REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__()
+        self._row = dict(row)
+        self._cookies_path = cookies_path
+        self._downloads_path = downloads_path
+        self._request_timeout = request_timeout
+
+    def run(self) -> None:
+        row = dict(self._row)
+        try:
+            ini_path = Path(str(row.get("ini_path") or ""))
+            if not ini_path.exists():
+                raise RuntimeError(f"LL Integration metadata was not found:\n{ini_path}")
+            if not self._downloads_path:
+                raise RuntimeError("MO2 downloads path is not available.")
+
+            self.statusChanged.emit(f"Finding latest archive: {row.get('mod') or ''}")
+            result = check_ini_for_updates(ini_path, self._cookies_path, timeout=self._request_timeout)
+            latest = result.get("latest") or {}
+            if not latest:
+                raise RuntimeError(f"No matching download found for:\n{result.get('knownFile') or row.get('file') or ''}")
+            if not result.get("updateAvailable"):
+                row.update({
+                    "status": "OK",
+                    "current": result.get("currentVersion") or row.get("current") or "",
+                    "latest": latest.get("version") or row.get("latest") or "",
+                    "file": latest.get("name") or row.get("file") or "",
+                    "info": "No update available after recheck",
+                })
+                self.rowReady.emit(row)
+                self.finished.emit(False)
+                return
+
+            download_url = urljoin(result.get("sourceUrl") or row.get("page_url") or "", latest.get("url") or "")
+            if not download_url:
+                raise RuntimeError("Latest download URL is missing.")
+
+            archive_name = safe_archive_name(latest.get("name") or row.get("file") or "")
+            archive_path = self._downloads_path / archive_name
+            already_exists = archive_path.exists()
+            if not already_exists:
+                self.statusChanged.emit(f"Downloading update: {archive_name}")
+                download_loverslab_archive(
+                    download_url,
+                    archive_path,
+                    self._cookies_path,
+                    referer=row.get("page_url") or result.get("sourceUrl") or "",
+                    timeout=max(self._request_timeout, 30.0),
+                )
+
+            sidecar = write_update_download_sidecar(ini_path, archive_path, latest, download_url)
+            row.update({
+                "status": "Downloaded",
+                "current": result.get("currentVersion") or row.get("current") or "",
+                "latest": latest.get("version") or row.get("latest") or "",
+                "file": archive_name,
+                "archive_path": str(archive_path),
+                "sidecar_path": str(sidecar),
+                "downloaded_now": True,
+                "latest_url": download_url,
+                "latest_size": latest.get("size") or "",
+                "latest_date_iso": latest.get("date_iso") or "",
+                "info": (
+                    "Already in MO2 downloads; metadata refreshed"
+                    if already_exists
+                    else f"Downloaded to MO2 downloads; metadata: {sidecar.name}"
+                ),
+            })
+            self.rowReady.emit(row)
+            self.finished.emit(False)
+        except Exception as exc:
+            row.update({
+                "status": "Error",
+                "info": str(exc),
+            })
+            self.rowReady.emit(row)
+            self.finished.emit(False)
 
 
 class LoversLabBaseTool(mobase.IPluginTool):
@@ -490,7 +790,7 @@ class LoversLabBaseTool(mobase.IPluginTool):
         return self.TOOL_DESCRIPTION
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo("0.1.0")
+        return mobase.VersionInfo("0.2.1")
 
     def settings(self) -> Sequence[mobase.PluginSetting]:
         paths = self._configured_paths()
@@ -555,6 +855,20 @@ class LoversLabBaseTool(mobase.IPluginTool):
     def _downloads_storage_path(self) -> Path:
         latest_ini = self._setting_path("ll_ini_path", DEFAULT_LATEST_INI)
         return latest_ini.parent
+
+    def _native_config_path(self) -> Path:
+        cookies = self._setting_path("cookies_path", DEFAULT_COOKIES)
+        native_app = cookies.parents[1] if len(cookies.parents) > 1 else cookies.parent
+        return native_app / "config.json"
+
+    def _read_native_config(self, path: Path) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _parentWidget(self):
         if self._organizer and hasattr(self._organizer, "mainWindow"):
@@ -937,6 +1251,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
                 "current": current_version,
                 "file": self._ll_file_name(ini_path),
                 "fixed": self._ll_fixed_update(ini_path),
+                "update_mode": self._ll_update_mode(ini_path),
             })
 
         return jobs
@@ -971,10 +1286,33 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             ll = read_ll_section(ini_path)
         except Exception:
             return False
+        mode = normalized_update_mode(
+            ll.get("update_mode"),
+            fixed=(
+                truthy(ll.get("fixed_version"))
+                or truthy(ll.get("manual_update"))
+                or truthy(ll.get("skip_update_check"))
+            ),
+        )
         return (
-            truthy(ll.get("fixed_version"))
+            mode == UPDATE_MODE_SKIP
+            or truthy(ll.get("fixed_version"))
             or truthy(ll.get("manual_update"))
             or truthy(ll.get("skip_update_check"))
+        )
+
+    def _ll_update_mode(self, ini_path: Path) -> str:
+        try:
+            ll = read_ll_section(ini_path)
+        except Exception:
+            return UPDATE_MODE_MANUAL
+        return normalized_update_mode(
+            ll.get("update_mode"),
+            fixed=(
+                truthy(ll.get("fixed_version"))
+                or truthy(ll.get("manual_update"))
+                or truthy(ll.get("skip_update_check"))
+            ),
         )
 
     def _show_results(self, jobs: list[dict], cookies_path: Path) -> None:
@@ -1034,6 +1372,24 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             "Use a high value like 120s to wait longer; timeout cannot be disabled safely."
         )
 
+        filter_mode = QComboBox(dialog)
+        filter_mode.addItems([
+            "All links",
+            "Updates",
+            "OK",
+            "Unknown / missing version",
+            "Manual links",
+            "Errors / skipped",
+            "Not checked",
+        ])
+        filter_mode.setToolTip("Filter the visible LL Integration rows. This does not change what metadata is stored.")
+
+        filter_text = QLineEdit(dialog)
+        filter_text.setPlaceholderText("Search mod, file, or page")
+        filter_text.setClearButtonEnabled(True)
+
+        filter_count = QLabel("", dialog)
+
         pacing_widgets = [delay, batch_size, batch_pause, request_timeout]
         fetch_updates.clicked.connect(
             lambda _checked=False: self._start_check_worker(
@@ -1066,7 +1422,13 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         table._ll_cookies_path = cookies_path
         table._ll_pacing_widgets = pacing_widgets
         table._ll_update_cache = update_cache
+        table._ll_filter_mode = filter_mode
+        table._ll_filter_text = filter_text
+        table._ll_filter_count = filter_count
         self._populate_results_table(table, jobs)
+        filter_mode.currentTextChanged.connect(lambda _text: self._apply_results_filter(table))
+        filter_text.textChanged.connect(lambda _text: self._apply_results_filter(table))
+        self._apply_results_filter(table)
 
         controls = QHBoxLayout()
         controls.addWidget(fetch_updates)
@@ -1089,7 +1451,14 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         pacing_controls.addWidget(request_timeout)
         pacing_controls.addStretch(1)
 
+        filter_controls = QHBoxLayout()
+        filter_controls.addWidget(QLabel("Filter"))
+        filter_controls.addWidget(filter_mode)
+        filter_controls.addWidget(filter_text, 1)
+        filter_controls.addWidget(filter_count)
+
         layout = QVBoxLayout(dialog)
+        layout.addLayout(filter_controls)
         layout.addWidget(table)
         layout.addWidget(progress)
         layout.addWidget(progress_label)
@@ -1269,6 +1638,106 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         dialog._ll_fetch_log_path = log_path
         thread.start()
 
+    def _start_try_update_worker(
+        self,
+        table: QTableWidget,
+        row_index: int,
+        action_button: QPushButton,
+    ) -> None:
+        dialog = getattr(table, "_ll_dialog", None)
+        if dialog is None:
+            return
+
+        current_worker = getattr(dialog, "_ll_worker", None)
+        if current_worker is not None:
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "A fetch or update download is already running. Cancel or wait for it to finish first.",
+            )
+            return
+
+        row = self._current_row_data(table, row_index)
+        if not self._row_try_update_enabled(row):
+            return
+
+        pacing = self._current_fetch_pacing_from_table(table)
+        cookies_path = getattr(table, "_ll_cookies_path", DEFAULT_COOKIES)
+        downloads_path = self._active_downloads_path()
+        if not downloads_path:
+            QMessageBox.critical(self._parentWidget(), PLUGIN_NAME, "MO2 downloads path is not available.")
+            return
+
+        progress = getattr(table, "_ll_progress", None)
+        progress_label = getattr(table, "_ll_progress_label", None)
+        fetch_updates = getattr(table, "_ll_fetch_updates", None)
+        cancel = getattr(table, "_ll_cancel", None)
+        close = getattr(table, "_ll_close", None)
+        pacing_widgets = getattr(table, "_ll_pacing_widgets", [])
+
+        row["info"] = "Downloading update..."
+        self._set_result_row_values(table, row_index, row)
+        if progress is not None:
+            progress.setRange(0, 0)
+        if progress_label is not None:
+            progress_label.setText(f"Downloading update: {row.get('mod') or ''}")
+        if fetch_updates is not None:
+            fetch_updates.setEnabled(False)
+        if cancel is not None:
+            cancel.setEnabled(False)
+        if close is not None:
+            close.setEnabled(False)
+        action_button.setEnabled(False)
+        for widget in pacing_widgets:
+            widget.setEnabled(False)
+
+        thread = QThread(dialog)
+        worker = TryUpdateWorker(
+            row,
+            Path(str(cookies_path)),
+            downloads_path,
+            request_timeout=pacing["request_timeout"],
+        )
+        worker.moveToThread(thread)
+        worker.rowReady.connect(lambda result: self._update_result_row(table, result))
+        if progress_label is not None:
+            worker.statusChanged.connect(lambda message: progress_label.setText(message))
+        worker.finished.connect(
+            lambda cancelled: self._finish_try_update_worker(
+                dialog,
+                thread,
+                progress,
+                progress_label,
+                fetch_updates,
+                cancel,
+                close,
+                action_button,
+                cancelled,
+                pacing_widgets,
+            )
+        )
+        thread.started.connect(worker.run)
+
+        dialog._ll_thread = thread
+        dialog._ll_worker = worker
+        thread.start()
+
+    def _active_downloads_path(self) -> Path | None:
+        try:
+            if self._organizer:
+                downloads = Path(str(self._organizer.downloadsPath()))
+                if str(downloads):
+                    return downloads
+        except Exception:
+            pass
+
+        try:
+            config = self._read_native_config(self._native_config_path())
+            downloads = Path(str(config.get("mo2_downloads_path") or ""))
+            return downloads if str(downloads) else None
+        except Exception:
+            return None
+
     def _current_fetch_pacing_from_table(self, table: QTableWidget) -> dict:
         pacing = self._load_fetch_pacing()
         widgets = getattr(table, "_ll_pacing_widgets", [])
@@ -1303,6 +1772,37 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         if close is not None:
             close.setEnabled(True)
         fetch_button.setEnabled(True)
+        for widget in pacing_widgets:
+            widget.setEnabled(True)
+        dialog._ll_worker = None
+        thread.quit()
+        thread.wait(1000)
+
+    def _finish_try_update_worker(
+        self,
+        dialog: QDialog,
+        thread: QThread,
+        progress: QProgressBar,
+        progress_label: QLabel,
+        fetch_updates: QPushButton,
+        cancel: QPushButton,
+        close: QPushButton,
+        action_button: QPushButton,
+        cancelled: bool,
+        pacing_widgets: list,
+    ) -> None:
+        if progress is not None:
+            progress.setRange(0, 1)
+            progress.setValue(1)
+        if progress_label is not None:
+            progress_label.setText("Done" if not cancelled else "Cancelled")
+        if fetch_updates is not None:
+            fetch_updates.setEnabled(True)
+        if cancel is not None:
+            cancel.setText("Cancel")
+            cancel.setEnabled(False)
+        if close is not None:
+            close.setEnabled(True)
         for widget in pacing_widgets:
             widget.setEnabled(True)
         dialog._ll_worker = None
@@ -1388,6 +1888,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             "current": job.get("current") or "",
             "file": job.get("file") or "",
             "fixed": bool(job.get("fixed")),
+            "update_mode": job.get("update_mode") or "",
         }
 
     def _cache_entry_for_job(self, job: dict, cache: dict) -> dict | None:
@@ -1412,8 +1913,14 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             "current": row.get("current") or "",
             "latest": row.get("latest") or "",
             "file": row.get("file") or "",
+            "archive_path": row.get("archive_path") or "",
+            "sidecar_path": row.get("sidecar_path") or "",
+            "latest_url": row.get("latest_url") or "",
+            "latest_size": row.get("latest_size") or "",
+            "latest_date_iso": row.get("latest_date_iso") or "",
             "page_url": row.get("page_url") or "",
             "fixed": bool(row.get("fixed")),
+            "update_mode": row.get("update_mode") or (UPDATE_MODE_SKIP if row.get("fixed") else UPDATE_MODE_MANUAL),
             "info": row.get("info") or "",
         }
 
@@ -1431,9 +1938,37 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             "page_url": job.get("page_url") or display.get("page_url") or "",
             "current": job.get("current") or display.get("current") or "",
             "fixed": bool(job.get("fixed")),
+            "update_mode": job.get("update_mode") or display.get("update_mode") or "",
+            "archive_path": display.get("archive_path") or "",
+            "sidecar_path": display.get("sidecar_path") or "",
+            "latest_url": display.get("latest_url") or "",
+            "latest_size": display.get("latest_size") or "",
+            "latest_date_iso": display.get("latest_date_iso") or "",
         })
 
         last_success = entry.get("last_success")
+        if display.get("status") == "Downloaded":
+            if self._downloaded_row_was_installed(display):
+                display["status"] = "Ready"
+                display["latest"] = ""
+                display["info"] = (
+                    f"Cached {display.get('checked_at') or 'unknown'}; "
+                    "downloaded archive appears installed"
+                )
+            elif not self._downloaded_archive_exists(display):
+                display["status"] = "Update"
+                display["info"] = (
+                    f"Cached {display.get('checked_at') or 'unknown'}; "
+                    "downloaded archive is missing"
+                )
+            else:
+                display["info"] = (
+                    f"Cached {display.get('checked_at') or 'unknown'}; "
+                    "downloaded archive waiting for manual install"
+                )
+            return display
+
+
         if display.get("status") in {"Error", "Skipped"} and isinstance(last_success, dict):
             display["latest"] = display.get("latest") or last_success.get("latest") or ""
             display["file"] = display.get("file") or last_success.get("file") or job.get("file") or ""
@@ -1446,9 +1981,105 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
 
         return display
 
+    def _downloaded_row_was_installed(self, row: dict) -> bool:
+        current = str(row.get("current") or "").strip()
+        latest = str(row.get("latest") or "").strip()
+        if not current or not latest:
+            return False
+        try:
+            return compare_versions(current, latest) >= 0
+        except Exception:
+            return current == latest
+
+    def _downloaded_archive_exists(self, row: dict) -> bool:
+        archive_path = str(row.get("archive_path") or "").strip()
+        if archive_path and Path(archive_path).exists():
+            return True
+
+        file_name = str(row.get("file") or "").strip()
+        if not file_name:
+            return False
+
+        explicit_path = Path(file_name)
+        if explicit_path.is_absolute():
+            return explicit_path.exists()
+
+        downloads = self._active_downloads_path()
+        if downloads:
+            candidate = downloads / file_name
+            if candidate.exists():
+                return True
+
+        ini_path = Path(str(row.get("ini_path") or ""))
+        if ini_path.exists():
+            try:
+                ll = read_ll_section(ini_path)
+                archive_path = ll.get("archive_path", "").strip()
+                if archive_path and Path(archive_path).exists():
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def _mark_update_as_downloaded_if_archive_exists(self, row: dict) -> dict:
+        archive = self._existing_latest_archive(row)
+        if not archive:
+            return row
+
+        updated = dict(row)
+        sidecar = Path(f"{archive}.ll.ini")
+        if not sidecar.exists():
+            try:
+                download_url = str(row.get("latest_url") or "")
+                write_update_download_sidecar(
+                    Path(str(row.get("ini_path") or "")),
+                    archive,
+                    {
+                        "name": archive.name,
+                        "version": row.get("latest") or "",
+                        "size": row.get("latest_size") or "",
+                        "date_iso": row.get("latest_date_iso") or "",
+                    },
+                    download_url,
+                )
+            except Exception:
+                pass
+
+        updated["status"] = "Downloaded"
+        updated["archive_path"] = str(archive)
+        updated["sidecar_path"] = str(sidecar)
+        updated["info"] = "Latest archive already exists in MO2 downloads; waiting for manual install"
+        return updated
+
+    def _existing_latest_archive(self, row: dict) -> Path | None:
+        file_name = safe_archive_name(str(row.get("file") or "").strip())
+        if not file_name:
+            return None
+
+        candidates = []
+        downloads = self._active_downloads_path()
+        if downloads:
+            candidates.append(downloads / file_name)
+
+        ini_path = Path(str(row.get("ini_path") or ""))
+        if ini_path.exists():
+            try:
+                ll = read_ll_section(ini_path)
+                archive_path = ll.get("archive_path", "").strip()
+                if archive_path:
+                    candidates.append(Path(archive_path))
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
     def _cache_result_row(self, table: QTableWidget, row: dict) -> None:
         status = row.get("status") or ""
-        if status not in {"OK", "Update", "Error", "Skipped"}:
+        if status not in {"OK", "Update", "Unknown", "Downloaded", "Error", "Skipped"}:
             return
 
         jobs = getattr(table, "_ll_jobs", [])
@@ -1532,14 +2163,76 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             pass
 
     def _prepare_results_table(self, table: QTableWidget) -> None:
-        columns = ["Mod", "Status", "Current", "Latest", "File", "Info", "Fetch", "Page", "Folder", "Edit", "Purge"]
+        columns = ["Mod", "Status", "Current", "Latest", "File", "Info", "Action", "Page", "Folder", "Edit", "Purge"]
         table.clear()
         table.setColumnCount(len(columns))
         table.setHorizontalHeaderLabels(columns)
         table.setRowCount(0)
         table.setWordWrap(False)
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        table._ll_row_data = {}
         self._set_results_column_widths(table)
+
+    def _apply_results_filter(self, table: QTableWidget) -> None:
+        mode_widget = getattr(table, "_ll_filter_mode", None)
+        text_widget = getattr(table, "_ll_filter_text", None)
+        count_widget = getattr(table, "_ll_filter_count", None)
+        mode = mode_widget.currentText() if mode_widget is not None else "All links"
+        query = text_widget.text().strip().lower() if text_widget is not None else ""
+        row_data = getattr(table, "_ll_row_data", {})
+
+        visible = 0
+        total = table.rowCount()
+        for row_index in range(total):
+            row = row_data.get(row_index) or self._row_from_table(table, row_index)
+            matches = self._row_matches_filter(row, mode, query)
+            table.setRowHidden(row_index, not matches)
+            if matches:
+                visible += 1
+
+        if count_widget is not None:
+            count_widget.setText(f"{visible} / {total}")
+
+    def _row_from_table(self, table: QTableWidget, row_index: int) -> dict:
+        def item_text(column: int) -> str:
+            item = table.item(row_index, column)
+            return item.text() if item is not None else ""
+
+        return {
+            "mod": item_text(0),
+            "status": item_text(1),
+            "current": item_text(2),
+            "latest": item_text(3),
+            "file": item_text(4),
+            "info": item_text(5),
+        }
+
+    def _row_matches_filter(self, row: dict, mode: str, query: str) -> bool:
+        status = str(row.get("status") or "")
+        fixed = bool(row.get("fixed")) or status == "Manual"
+        current = str(row.get("current") or "").strip()
+
+        if mode == "Updates" and status != "Update":
+            return False
+        if mode == "OK" and status != "OK":
+            return False
+        if mode == "Unknown / missing version" and status != "Unknown" and (current or fixed):
+            return False
+        if mode == "Manual links" and not fixed:
+            return False
+        if mode == "Errors / skipped" and status not in {"Error", "Skipped"}:
+            return False
+        if mode == "Not checked" and status not in {"Ready", "Queued"}:
+            return False
+
+        if not query:
+            return True
+
+        haystack = " ".join(
+            str(row.get(key) or "")
+            for key in ("mod", "file", "page_url", "info", "status", "current", "latest", "update_mode")
+        ).lower()
+        return query in haystack
 
     def _populate_results_table(self, table: QTableWidget, jobs: list[dict]) -> None:
         cache = getattr(table, "_ll_update_cache", {"entries": {}})
@@ -1560,11 +2253,18 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
                 self._append_result_row(table, self._pending_row(job, "Queued", "Waiting"))
             else:
                 self._set_result_row_values(table, index, self._pending_row(job, "Queued", "Waiting"))
+        self._apply_results_filter(table)
 
     def _pending_row(self, job: dict, status: str, info: str) -> dict:
+        update_mode = normalized_update_mode(
+            job.get("update_mode"),
+            fixed=bool(job.get("fixed")),
+        )
         if job.get("fixed"):
             status = "Manual"
-            info = "Fixed/manual link; update fetch skipped"
+            info = "Skip updates; update fetch skipped"
+        elif info in {"Not checked", "Waiting"}:
+            info = f"{update_mode_label(update_mode)}; {info.lower()}"
 
         return {
             "row_index": job.get("row_index", 0),
@@ -1578,6 +2278,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             "file": job.get("file") or "",
             "page_url": job.get("page_url") or "",
             "fixed": bool(job.get("fixed")),
+            "update_mode": update_mode,
             "info": info,
         }
 
@@ -1615,14 +2316,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         row_index = table.rowCount()
         table.insertRow(row_index)
         self._set_result_row_values(table, row_index, row)
-
-        fetch_button = QPushButton("Fetch")
-        fetch_button.setEnabled(self._row_fetch_enabled(row))
-        fetch_button.clicked.connect(
-            lambda _checked=False, index=row_index, data=row, button=fetch_button:
-                self._start_single_check_worker(table, index, data, button)
-        )
-        table.setCellWidget(row_index, 6, fetch_button)
+        self._configure_action_button(table, row_index, row)
 
         page_url = row.get("page_url") or ""
         open_button = QPushButton("Open")
@@ -1672,16 +2366,75 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
     def _row_fetch_enabled(self, row: dict) -> bool:
         return (
             bool(row.get("ini_path"))
-            and bool(row.get("current"))
+            and bool(row.get("page_url"))
             and not bool(row.get("fixed"))
             and Path(str(row.get("ini_path") or "")).exists()
         )
+
+    def _row_try_update_enabled(self, row: dict) -> bool:
+        return (
+            str(row.get("status") or "") == "Update"
+            and bool(row.get("ini_path"))
+            and bool(row.get("page_url"))
+            and not bool(row.get("fixed"))
+            and normalized_update_mode(row.get("update_mode")) != UPDATE_MODE_SKIP
+            and Path(str(row.get("ini_path") or "")).exists()
+        )
+
+    def _configure_action_button(self, table: QTableWidget, row_index: int, row: dict) -> QPushButton:
+        button = table.cellWidget(row_index, 6)
+        if not isinstance(button, QPushButton):
+            button = QPushButton()
+            table.setCellWidget(row_index, 6, button)
+        try:
+            button.clicked.disconnect()
+        except Exception:
+            pass
+
+        status = str(row.get("status") or "")
+        if status == "Downloaded":
+            button.setText("Install")
+            button.setEnabled(self._downloaded_archive_exists(row))
+            button.clicked.connect(
+                lambda _checked=False, index=row_index:
+                    self._prompt_install_downloaded_update(table, index)
+            )
+            return button
+
+        if self._row_try_update_enabled(row):
+            button.setText("Try Update")
+            button.setEnabled(True)
+            button.clicked.connect(
+                lambda _checked=False, index=row_index, action_button=button:
+                    self._start_try_update_worker(table, index, action_button)
+            )
+            return button
+
+        button.setText("Fetch")
+        button.setEnabled(self._row_fetch_enabled(row))
+        button.clicked.connect(
+            lambda _checked=False, index=row_index, action_button=button:
+                self._start_single_check_worker(
+                    table,
+                    index,
+                    self._current_row_data(table, index),
+                    action_button,
+                )
+        )
+        return button
+
+    def _current_row_data(self, table: QTableWidget, row_index: int) -> dict:
+        row_data = getattr(table, "_ll_row_data", {})
+        if row_index in row_data:
+            return dict(row_data[row_index])
+        return self._row_from_table(table, row_index)
 
     def _update_result_row(self, table: QTableWidget, row: dict) -> None:
         row_index = int(row.get("row_index", -1))
         if row_index < 0 or row_index >= table.rowCount():
             self._append_result_row(table, row)
             self._cache_result_row(table, row)
+            self._apply_results_filter(table)
             return
 
         display_row = dict(row)
@@ -1698,10 +2451,19 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
                 f"last OK {success.get('checked_at') or 'unknown'}"
             )
 
+        if display_row.get("status") == "Update":
+            display_row = self._mark_update_as_downloaded_if_archive_exists(display_row)
+
         self._set_result_row_values(table, row_index, display_row)
-        self._cache_result_row(table, row)
+        self._cache_result_row(table, display_row)
+        self._maybe_prompt_assisted_install(table, row_index, display_row)
+        self._apply_results_filter(table)
 
     def _set_result_row_values(self, table: QTableWidget, row_index: int, row: dict) -> None:
+        row_data = getattr(table, "_ll_row_data", {})
+        row_data[row_index] = dict(row)
+        table._ll_row_data = row_data
+
         values = [
             row.get("mod") or "",
             row.get("status") or "",
@@ -1719,6 +2481,108 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             item.setText(str(value))
             if column_index == 1:
                 self._style_status_item(item, row.get("status") or "")
+        if table.columnCount() > 6:
+            self._configure_action_button(table, row_index, row)
+
+    def _maybe_prompt_assisted_install(self, table: QTableWidget, row_index: int, row: dict) -> None:
+        if not row.get("downloaded_now"):
+            return
+        if str(row.get("status") or "") != "Downloaded":
+            return
+        if normalized_update_mode(row.get("update_mode")) != UPDATE_MODE_ASSISTED:
+            return
+        self._prompt_install_downloaded_update(table, row_index, row)
+
+    def _prompt_install_downloaded_update(
+        self,
+        table: QTableWidget,
+        row_index: int,
+        row: dict | None = None,
+    ) -> None:
+        row = dict(row or self._current_row_data(table, row_index))
+        if not self._organizer or not hasattr(self._organizer, "installMod"):
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "The update archive was downloaded, but this MO2 version does not expose installMod to tools.",
+            )
+            return
+
+        archive_path = Path(str(row.get("archive_path") or ""))
+        if not archive_path.exists():
+            archive_path = self._existing_latest_archive(row) or archive_path
+        if not archive_path.exists():
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                f"The update archive was downloaded but could not be found:\n{archive_path}",
+            )
+            return
+
+        mod_name = row.get("mod") or row.get("internal_name") or archive_path.stem
+        message = QMessageBox(self._parentWidget())
+        message.setWindowTitle("LL Integration Assisted Install")
+        message.setIcon(QMessageBox.Icon.Question)
+        message.setText(f"Install downloaded update for:\n{mod_name}")
+        message.setInformativeText(
+            f"Current: {row.get('current') or '?'}\n"
+            f"Latest: {row.get('latest') or '?'}\n"
+            f"Archive: {archive_path.name}\n"
+            f"Target mod folder: {row.get('mod_path') or '?'}\n\n"
+            "MO2 will handle the install/replace flow."
+        )
+        install_button = message.addButton("Install / Replace in MO2", QMessageBox.ButtonRole.AcceptRole)
+        keep_button = message.addButton("Keep Downloaded", QMessageBox.ButtonRole.RejectRole)
+        message.setDefaultButton(install_button)
+        message.exec()
+
+        if message.clickedButton() != install_button:
+            self._mark_assisted_prompt_seen(table, row_index, row, "Downloaded; waiting for manual install")
+            return
+
+        try:
+            installed_mod = self._organizer.installMod(str(archive_path), str(mod_name))
+        except Exception as exc:
+            QMessageBox.critical(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                f"MO2 install failed:\n\n{exc}",
+            )
+            self._mark_assisted_prompt_seen(table, row_index, row, "Downloaded; MO2 install failed")
+            return
+
+        if installed_mod is None:
+            self._mark_assisted_prompt_seen(table, row_index, row, "Downloaded; MO2 install cancelled")
+            return
+
+        sidecar = Path(str(row.get("sidecar_path") or f"{archive_path}.ll.ini"))
+        try:
+            if sidecar.exists():
+                target = write_mod_ll_metadata_from_file(installed_mod, sidecar)
+                write_mod_general_source_metadata(installed_mod, row.get("page_url") or "", row.get("latest") or "")
+                self._organizer.modDataChanged(installed_mod)
+        except Exception as exc:
+            QMessageBox.warning(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                f"Installed through MO2, but metadata refresh failed:\n\n{exc}",
+            )
+
+        updated = dict(row)
+        updated["downloaded_now"] = False
+        updated["status"] = "Ready"
+        updated["current"] = row.get("latest") or row.get("current") or ""
+        updated["latest"] = ""
+        updated["info"] = "Assisted install completed; not checked"
+        self._set_result_row_values(table, row_index, updated)
+        self._update_backing_job(table, row_index, updated)
+        self._remove_cached_result(table, updated)
+
+    def _mark_assisted_prompt_seen(self, table: QTableWidget, row_index: int, row: dict, info: str) -> None:
+        updated = dict(row)
+        updated["downloaded_now"] = False
+        updated["info"] = info
+        self._set_result_row_values(table, row_index, updated)
 
     def _edit_row_link(self, table: QTableWidget, row_index: int, row: dict) -> None:
         ini_path = Path(str(row.get("ini_path") or ""))
@@ -1744,7 +2608,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         ll = config[LL_SECTION]
         dialog = QDialog(self._parentWidget())
         dialog.setWindowTitle("Edit LoversLab Link")
-        dialog.resize(680, 220)
+        dialog.resize(700, 240)
 
         page_url = QLineEdit(ll.get("page_url", "").strip(), dialog)
         version = QLineEdit(ll.get("version", "").strip(), dialog)
@@ -1754,13 +2618,18 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             or ll.get("archive_name", "").strip(),
             dialog,
         )
-        fixed_version = QCheckBox("Fixed/manual link (skip update fetch)", dialog)
-        fixed_version.setChecked(
+        existing_fixed = (
             truthy(ll.get("fixed_version"))
             or truthy(ll.get("manual_update"))
             or truthy(ll.get("skip_update_check"))
         )
+        update_mode = QComboBox(dialog)
+        configure_update_mode_combo(
+            update_mode,
+            normalized_update_mode(ll.get("update_mode"), fixed=existing_fixed),
+        )
         try_pattern = QPushButton("Try Pattern", dialog)
+        pattern_help = QPushButton("Pattern Help", dialog)
 
         layout = QGridLayout(dialog)
         layout.addWidget(QLabel(f"Mod: {row.get('mod') or ''}"), 0, 0, 1, 2)
@@ -1770,21 +2639,32 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         layout.addWidget(version, 2, 1)
         layout.addWidget(QLabel("File pattern"), 3, 0)
         layout.addWidget(file_pattern, 3, 1)
-        layout.addWidget(fixed_version, 4, 1)
+        layout.addWidget(QLabel("Update mode"), 4, 0)
+        layout.addWidget(update_mode, 4, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         action_row = QHBoxLayout()
         action_row.addWidget(try_pattern)
+        action_row.addWidget(pattern_help)
         action_row.addStretch(1)
         action_row.addWidget(buttons)
         layout.addLayout(action_row, 5, 0, 1, 2)
 
         try_pattern.clicked.connect(
             lambda _checked=False:
-                self._try_link_pattern(page_url.text().strip(), file_pattern.text().strip())
+                self._try_link_pattern(
+                    table,
+                    row_index,
+                    row,
+                    config,
+                    page_url,
+                    version,
+                    file_pattern,
+                )
         )
+        pattern_help.clicked.connect(lambda _checked=False: self._show_pattern_help())
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1792,7 +2672,8 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         new_url = page_url.text().strip()
         new_version = version.text().strip()
         new_pattern = file_pattern.text().strip()
-        new_fixed = fixed_version.isChecked()
+        new_update_mode = normalized_update_mode(str(update_mode.currentData() or ""))
+        new_fixed = new_update_mode == UPDATE_MODE_SKIP
         if not new_url:
             QMessageBox.critical(self._parentWidget(), PLUGIN_NAME, "LoversLab page URL is required.")
             return
@@ -1800,7 +2681,10 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         ll["page_url"] = new_url
         ll["version"] = new_version
         ll["file_pattern"] = new_pattern
+        ll["update_mode"] = new_update_mode
         ll["fixed_version"] = "true" if new_fixed else "false"
+        ll["manual_update"] = "true" if new_fixed else "false"
+        ll["skip_update_check"] = "true" if new_fixed else "false"
         if new_pattern and not ll.get("file_name", "").strip():
             ll["file_name"] = new_pattern
 
@@ -1811,24 +2695,20 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         row["current"] = new_version
         row["file"] = new_pattern
         row["fixed"] = new_fixed
+        row["update_mode"] = new_update_mode
         row["status"] = "Manual" if new_fixed else "Ready"
         row["latest"] = ""
-        row["info"] = "Fixed/manual link; update fetch skipped" if new_fixed else "Edited; not checked"
+        row["info"] = "Updates skipped" if new_fixed else f"Mode: {update_mode_label(new_update_mode)}; not checked"
         self._set_result_row_values(table, row_index, row)
         self._update_backing_job(table, row_index, row)
 
-        fetch_button = QPushButton("Fetch")
-        fetch_button.setEnabled(self._row_fetch_enabled(row))
-        fetch_button.clicked.connect(
-            lambda _checked=False, index=row_index, data=row, button=fetch_button:
-                self._start_single_check_worker(table, index, data, button)
-        )
-        table.setCellWidget(row_index, 6, fetch_button)
+        self._configure_action_button(table, row_index, row)
 
         open_button = QPushButton("Open")
         open_button.setEnabled(bool(new_url))
         open_button.clicked.connect(lambda _checked=False, url=new_url: webbrowser.open(url))
         table.setCellWidget(row_index, 7, open_button)
+        self._apply_results_filter(table)
 
     def _update_backing_job(self, table: QTableWidget, row_index: int, row: dict) -> None:
         jobs = getattr(table, "_ll_jobs", [])
@@ -1840,9 +2720,21 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             "current": row.get("current") or "",
             "file": row.get("file") or "",
             "fixed": bool(row.get("fixed")),
+            "update_mode": row.get("update_mode") or "",
         })
 
-    def _try_link_pattern(self, page_url: str, pattern: str) -> None:
+    def _try_link_pattern(
+        self,
+        table: QTableWidget,
+        row_index: int,
+        row: dict,
+        config: configparser.ConfigParser,
+        page_url_widget: QLineEdit,
+        version_widget: QLineEdit,
+        pattern_widget: QLineEdit,
+    ) -> None:
+        page_url = page_url_widget.text().strip()
+        pattern = pattern_widget.text().strip()
         if not page_url:
             QMessageBox.critical(self._parentWidget(), PLUGIN_NAME, "LoversLab page URL is required.")
             return
@@ -1875,14 +2767,111 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             )
             return
 
+        message = QMessageBox(self._parentWidget())
+        message.setWindowTitle(PLUGIN_NAME)
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setText("Pattern matched.")
+        message.setInformativeText(
+            f"File: {match.name}\n"
+            f"Detected version: {match.version or '<unknown>'}\n"
+            f"Pattern: {pattern}\n"
+            f"Size: {match.size or '<unknown>'}\n\n"
+            f"Downloads seen: {len(downloads)}"
+        )
+        use_button = message.addButton("Use Match", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = message.addButton(QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(use_button)
+        message.exec()
+        if message.clickedButton() != use_button:
+            return
+
+        self._apply_pattern_match(
+            table,
+            row_index,
+            row,
+            config,
+            page_url,
+            pattern,
+            match,
+            version_widget,
+            pattern_widget,
+        )
+
+    def _apply_pattern_match(
+        self,
+        table: QTableWidget,
+        row_index: int,
+        row: dict,
+        config: configparser.ConfigParser,
+        page_url: str,
+        pattern: str,
+        match,
+        version_widget: QLineEdit,
+        pattern_widget: QLineEdit,
+    ) -> None:
+        if LL_SECTION not in config:
+            QMessageBox.critical(self._parentWidget(), PLUGIN_NAME, "LoversLab metadata section is missing.")
+            return
+
+        detected_version = match.version or ""
+        if not detected_version:
+            QMessageBox.warning(self._parentWidget(), PLUGIN_NAME, "No version was detected from the matched file.")
+            return
+
+        ini_path = Path(str(row.get("ini_path") or ""))
+        if not ini_path.exists():
+            QMessageBox.critical(self._parentWidget(), PLUGIN_NAME, f"Metadata file is missing:\n{ini_path}")
+            return
+
+        ll = config[LL_SECTION]
+        ll["page_url"] = page_url
+        ll["version"] = detected_version
+        ll["file_pattern"] = pattern
+        ll["file_name"] = match.name
+        ll["archive_name"] = match.name
+        ll["original_archive_name"] = match.name
+        if match.size:
+            ll["size"] = match.size
+        if match.date_iso:
+            ll["date_iso"] = match.date_iso
+        if match.url:
+            ll["download_url"] = match.url
+
+        with ini_path.open("w", encoding="utf-8") as file:
+            config.write(file, space_around_delimiters=False)
+
+        version_widget.setText(detected_version)
+        pattern_widget.setText(pattern)
+
+        updated = dict(row)
+        updated["page_url"] = page_url
+        updated["current"] = detected_version
+        updated["file"] = match.name
+        updated["latest"] = ""
+        updated["status"] = "Ready"
+        updated["info"] = "Pattern match applied; not checked"
+        updated["fixed"] = bool(row.get("fixed"))
+        updated["update_mode"] = row.get("update_mode") or UPDATE_MODE_MANUAL
+        self._set_result_row_values(table, row_index, updated)
+        self._update_backing_job(table, row_index, updated)
+        self._remove_cached_result(table, updated)
+
+    def _show_pattern_help(self) -> None:
         QMessageBox.information(
             self._parentWidget(),
             PLUGIN_NAME,
-            "Pattern matched:\n\n"
-            f"File: {match.name}\n"
-            f"Version: {match.version or '<unknown>'}\n"
-            f"Size: {match.size or '<unknown>'}\n\n"
-            f"Downloads seen: {len(downloads)}",
+            "File pattern examples:\n\n"
+            "* matches any text.\n"
+            "{version} marks where the version is in the file name.\n\n"
+            "ModName_0.45Beta5.7z\n"
+            "Pattern: ModName_{version}.7z\n"
+            "Detected version: 0.45.5\n\n"
+            "ModName0.13_SE.zip\n"
+            "Pattern: ModName{version}_SE.zip\n"
+            "Detected version: 0.13\n\n"
+            "ModName0.80beta8 - SE.7z\n"
+            "Pattern: ModName{version}beta{version} - SE.7z\n"
+            "Detected version: 0.80.8",
         )
 
     def _purge_row_ll_ini(
@@ -1945,14 +2934,21 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         if error_item is not None:
             error_item.setText("; ".join(actions) if actions else "nothing changed")
 
+        row["status"] = "Purged"
+        row["info"] = "; ".join(actions) if actions else "nothing changed"
+        self._set_result_row_values(table, row_index, row)
+        self._apply_results_filter(table)
+
     def _style_status_item(self, item: QTableWidgetItem, status: str) -> None:
         colors = {
             "OK": QColor(44, 140, 68),
             "Update": QColor(180, 130, 0),
             "Manual": QColor(105, 150, 190),
+            "Downloaded": QColor(44, 140, 68),
             "Ready": QColor(145, 145, 145),
             "Queued": QColor(145, 145, 145),
             "Untracked": QColor(145, 145, 145),
+            "Unknown": QColor(145, 145, 145),
             "Purged": QColor(145, 145, 145),
             "Skipped": QColor(145, 145, 145),
             "Error": QColor(190, 45, 45),
@@ -2341,7 +3337,9 @@ class LoversLabCreateLinkTool(LoversLabBaseTool):
         version.setPlaceholderText("Installed version, for example 1.2.3 or 5-60")
         file_pattern.setPlaceholderText("Optional, for example Example Mod 5-* - FULL*")
         multipart = QCheckBox("Multipart or manual install", dialog)
-        manual = QCheckBox("Manual download/install", dialog)
+        manual = QCheckBox("Manual source link", dialog)
+        update_mode = QComboBox(dialog)
+        configure_update_mode_combo(update_mode, UPDATE_MODE_MANUAL)
         multipart.setChecked(True)
         manual.setChecked(True)
 
@@ -2355,11 +3353,13 @@ class LoversLabCreateLinkTool(LoversLabBaseTool):
         layout.addWidget(file_pattern, 3, 1)
         layout.addWidget(multipart, 4, 1)
         layout.addWidget(manual, 5, 1)
+        layout.addWidget(QLabel("Update mode"), 6, 0)
+        layout.addWidget(update_mode, 6, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons, 6, 0, 1, 2)
+        layout.addWidget(buttons, 7, 0, 1, 2)
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
@@ -2377,12 +3377,17 @@ class LoversLabCreateLinkTool(LoversLabBaseTool):
             "file_pattern": file_pattern.text().strip(),
             "multipart": multipart.isChecked(),
             "manual_install": manual.isChecked(),
+            "update_mode": normalized_update_mode(str(update_mode.currentData() or "")),
         }
 
     def _ll_ini_text(self, values: dict) -> str:
         ll_id_match = re.search(r"/files/file/(\d+)", values["page_url"])
         ll_id = ll_id_match.group(1) if ll_id_match else ""
         is_loverslab = "loverslab.com" in values["page_url"].lower()
+        update_mode = normalized_update_mode(values.get("update_mode"))
+        if not is_loverslab:
+            update_mode = UPDATE_MODE_SKIP
+        skip_updates = update_mode == UPDATE_MODE_SKIP
         lines = [
             "[LoversLab]",
             f"source={'loverslab' if is_loverslab else 'external'}",
@@ -2403,10 +3408,11 @@ class LoversLabCreateLinkTool(LoversLabBaseTool):
             "archive_path=",
             "browser_download_url=",
             "completed_at=",
-            f"fixed_version={str(values['manual_install']).lower()}",
+            f"update_mode={update_mode}",
+            f"fixed_version={str(skip_updates).lower()}",
             f"manual_install={str(values['manual_install']).lower()}",
-            f"manual_update={str(values['manual_install']).lower()}",
-            f"skip_update_check={str((not is_loverslab) or values['manual_install']).lower()}",
+            f"manual_update={str(skip_updates).lower()}",
+            f"skip_update_check={str(skip_updates).lower()}",
             f"multipart={str(values['multipart']).lower()}",
             f"file_pattern={values.get('file_pattern') or ''}",
             "",
@@ -2642,7 +3648,7 @@ class LoversLabInstallBinder(mobase.IPluginInstallerSimple):
         return "Binds LoversLab sidecar metadata to a mod after installation."
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo("0.1.0")
+        return mobase.VersionInfo("0.2.1")
 
     def settings(self) -> Sequence[mobase.PluginSetting]:
         return []
@@ -2679,8 +3685,9 @@ class LoversLabInstallBinder(mobase.IPluginInstallerSimple):
                 return
 
             target = mod_meta_path(new_mod)
-            if mod_ll_metadata_path(new_mod):
-                self._log(f"target exists, skip target={target}")
+            existing = mod_ll_metadata_path(new_mod)
+            if existing and not ll_metadata_same_source(existing, sidecar):
+                self._log(f"target exists with different LL source, skip target={target} sidecar={sidecar}")
                 return
             is_nexus, reason = mod_has_nexus_identity(new_mod)
             if is_nexus:
@@ -2691,7 +3698,7 @@ class LoversLabInstallBinder(mobase.IPluginInstallerSimple):
             self._apply_mod_metadata(new_mod, target)
             if self._organizer:
                 self._organizer.modDataChanged(new_mod)
-            self._log(f"bound sidecar={sidecar} target={target}")
+            self._log(f"bound sidecar={sidecar} target={target} replaced_existing={bool(existing)}")
         except Exception as exc:
             self._log(f"bind error: {exc}")
 
@@ -2773,10 +3780,7 @@ class LoversLabInstallBinder(mobase.IPluginInstallerSimple):
 
         page_url = ll.get("page_url", "").strip()
         version = ll.get("version", "").strip()
-        if page_url:
-            mod.setUrl(page_url)
-        if version:
-            mod.setVersion(mobase.VersionInfo(version))
+        write_mod_general_source_metadata(mod, page_url, version)
 
     def _log(self, message: str) -> None:
         try:
@@ -2797,17 +3801,26 @@ class LoversLabInstallObserver(mobase.IPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._organizer = None
+        self._sync_timer = None
+        self._last_synced_downloads_path = ""
 
     def init(self, organizer: mobase.IOrganizer) -> bool:
         self._organizer = organizer
+        self._sync_active_instance_config()
+        self._start_active_instance_sync_timer()
         ok = organizer.modList().onModInstalled(self._on_mod_installed)
+        profile_ok = False
+        try:
+            profile_ok = organizer.onProfileChanged(self._on_profile_changed)
+        except Exception as exc:
+            self._log(f"profile change hook failed: {exc}")
         download_ok = False
         try:
             download_ok = organizer.downloadManager().onDownloadRemoved(self._on_download_removed)
         except Exception as exc:
             self._log(f"download remove hook failed: {exc}")
 
-        self._log(f"init onModInstalled={ok} onDownloadRemoved={download_ok}")
+        self._log(f"init onModInstalled={ok} onProfileChanged={profile_ok} onDownloadRemoved={download_ok}")
         return True
 
     def name(self) -> str:
@@ -2823,10 +3836,68 @@ class LoversLabInstallObserver(mobase.IPlugin):
         return "Binds LoversLab metadata when MO2 reports a new mod installation."
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo("0.1.0")
+        return mobase.VersionInfo("0.2.1")
 
     def settings(self) -> Sequence[mobase.PluginSetting]:
         return []
+
+    def _start_active_instance_sync_timer(self) -> None:
+        if self._sync_timer is not None:
+            return
+
+        self._sync_timer = QTimer()
+        self._sync_timer.setInterval(5000)
+        self._sync_timer.timeout.connect(self._sync_active_instance_config)
+        self._sync_timer.start()
+
+    def _sync_active_instance_config(self) -> None:
+        if not self._organizer:
+            return
+
+        config_path = self._native_config_path()
+        try:
+            if config_path.exists():
+                data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+                config = data if isinstance(data, dict) else {}
+            else:
+                config = {}
+
+            mo2_root = Path(str(self._organizer.basePath()))
+            downloads_path = Path(str(self._organizer.downloadsPath()))
+            downloads_text = str(downloads_path)
+            if downloads_text == self._last_synced_downloads_path and config_path.exists():
+                return
+
+            mo2_exe = mo2_root / "ModOrganizer.exe"
+            config.update(
+                {
+                    "mo2_downloads_path": downloads_text,
+                    "active_mo2_instance_path": str(mo2_root),
+                    "active_mo2_plugin_path": str(Path(__file__).resolve().parent),
+                    "active_mo2_game": self._managed_game_name(),
+                    "active_mo2_synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            )
+            if mo2_exe.exists():
+                config["mo2_path"] = str(mo2_exe)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+            self._last_synced_downloads_path = downloads_text
+            self._log(f"active instance synced downloads={downloads_path}")
+        except Exception as exc:
+            self._log(f"active instance sync failed: {exc}")
+
+    def _managed_game_name(self) -> str:
+        try:
+            game = self._organizer.managedGame() if self._organizer else None
+            if game and hasattr(game, "gameName"):
+                return str(game.gameName())
+        except Exception:
+            pass
+        return ""
+
+    def _on_profile_changed(self, _old_profile, _new_profile) -> None:
+        self._sync_active_instance_config()
 
     def _on_mod_installed(self, mod_or_name) -> None:
         try:
@@ -2836,9 +3907,6 @@ class LoversLabInstallObserver(mobase.IPlugin):
                 return
 
             target = mod_meta_path(mod)
-            if mod_ll_metadata_path(mod):
-                self._log(f"skip existing LL Integration metadata target={target}")
-                return
             is_nexus, reason = mod_has_nexus_identity(mod)
             if is_nexus:
                 self._log(f"skip Nexus-identified mod: {reason} target={target}")
@@ -2848,12 +3916,16 @@ class LoversLabInstallObserver(mobase.IPlugin):
             if not sidecar:
                 self._log("no recent installed LL sidecar found")
                 return
+            existing = mod_ll_metadata_path(mod)
+            if existing and not ll_metadata_same_source(existing, sidecar):
+                self._log(f"skip existing different LL source target={target} sidecar={sidecar}")
+                return
 
             target = write_mod_ll_metadata_from_file(mod, sidecar)
             self._apply_mod_metadata(mod, target)
             if self._organizer:
                 self._organizer.modDataChanged(mod)
-            self._log(f"auto-bound sidecar={sidecar} target={target}")
+            self._log(f"auto-bound sidecar={sidecar} target={target} replaced_existing={bool(existing)}")
         except Exception as exc:
             self._log(f"auto-bind error: {exc}")
 
@@ -3057,10 +4129,7 @@ class LoversLabInstallObserver(mobase.IPlugin):
 
         page_url = ll.get("page_url", "").strip()
         version = ll.get("version", "").strip()
-        if page_url:
-            mod.setUrl(page_url)
-        if version:
-            mod.setVersion(mobase.VersionInfo(version))
+        write_mod_general_source_metadata(mod, page_url, version)
 
     def _log(self, message: str) -> None:
         for path in self._log_paths():

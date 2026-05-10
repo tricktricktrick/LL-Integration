@@ -10,6 +10,7 @@ Alpha tooling for connecting Firefox or Opera/Chromium downloads from LoversLab 
 - Copies supported archives into the configured MO2 downloads folder.
 - Adds MO2 tools for managing source links, opening source pages, editing manual links, and checking updates.
 - Stores installed mod source links in MO2 `meta.ini` under `[LoversLab]`, so the metadata does not appear as a mod file conflict.
+- When installed into multiple MO2 instances, the active instance keeps the browser bridge downloads path in sync.
 
 Supported archive extensions are `.7z`, `.zip`, and `.rar`.
 
@@ -32,6 +33,8 @@ Supported archive extensions are `.7z`, `.zip`, and `.rar`.
 7. In MO2, open `Tools > LL Integration`.
 
 The installer writes the native bridge to `%LOCALAPPDATA%\LLIntegration` and registers Firefox plus Chromium Native Messaging manifests for the current Windows user.
+
+For portable or multi-game MO2 setups, run the installer once for each MO2 instance where you want the plugin. After that, opening or switching to an instance makes it the active target for new browser downloads.
 
 ## Firefox Workflow
 

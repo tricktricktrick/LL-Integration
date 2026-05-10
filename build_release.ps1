@@ -28,6 +28,53 @@ function Remove-IfExists {
     }
 }
 
+function New-ExtensionZip {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDir,
+        [Parameter(Mandatory = $true)][string]$DestinationZip,
+        [string[]]$Exclude = @()
+    )
+
+    Add-Type -AssemblyName System.IO.Compression
+    Remove-IfExists $DestinationZip
+
+    $sourceRoot = (Resolve-Path -LiteralPath $SourceDir).Path.TrimEnd("\", "/")
+    $excludeSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $Exclude) {
+        [void]$excludeSet.Add(($item -replace "\\", "/"))
+    }
+
+    $zipStream = [System.IO.File]::Open($DestinationZip, [System.IO.FileMode]::CreateNew)
+    try {
+        $zip = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            Get-ChildItem -LiteralPath $sourceRoot -Recurse -File | ForEach-Object {
+                $relativePath = $_.FullName.Substring($sourceRoot.Length).TrimStart("\", "/") -replace "\\", "/"
+                if ($excludeSet.Contains($relativePath)) {
+                    return
+                }
+
+                $entry = $zip.CreateEntry($relativePath, [System.IO.Compression.CompressionLevel]::Optimal)
+                $inputStream = [System.IO.File]::OpenRead($_.FullName)
+                try {
+                    $entryStream = $entry.Open()
+                    try {
+                        $inputStream.CopyTo($entryStream)
+                    } finally {
+                        $entryStream.Dispose()
+                    }
+                } finally {
+                    $inputStream.Dispose()
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    } finally {
+        $zipStream.Dispose()
+    }
+}
+
 Write-Host "Building native messaging helper..."
 Remove-IfExists "dist\ll_integration_native.exe"
 Invoke-Checked {
@@ -69,8 +116,10 @@ Remove-Item -LiteralPath "native-app\ll_integration_native.exe" -Force
 Remove-IfExists "dist\ll_integration_native.exe"
 
 Write-Host "Packaging Opera/Chromium extension..."
-Remove-IfExists "dist\LLIntegration-Opera-MV3.zip"
-Compress-Archive -Path "opera-extension\*" -DestinationPath "dist\LLIntegration-Opera-MV3.zip" -Force
+New-ExtensionZip `
+    -SourceDir "opera-extension" `
+    -DestinationZip "dist\LLIntegration-Opera-MV3.zip" `
+    -Exclude @("icons/ll_integration.svg")
 
 Write-Host ""
 Write-Host "Release artifacts:"

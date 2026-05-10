@@ -8,6 +8,7 @@ const cancelButton = document.getElementById("cancelButton");
 const rows = {
   native: document.getElementById("nativeStatus"),
   mo2: document.getElementById("mo2Status"),
+  active: document.getElementById("activeStatus"),
   downloads: document.getElementById("downloadsStatus"),
   cookies: document.getElementById("cookiesStatus"),
 };
@@ -20,6 +21,13 @@ function setRow(row, state, text) {
 
 function setMessage(text) {
   message.textContent = text || "";
+}
+
+function activeTargetSummary(status) {
+  const mo2 = status.mo2 || {};
+  const instancePath = mo2.activeInstancePath || "";
+  const game = mo2.activeGame ? `${mo2.activeGame} - ` : "";
+  return instancePath ? `${game}${instancePath}` : "";
 }
 
 function pendingSummary(response) {
@@ -47,9 +55,6 @@ function summarizeReady(status) {
   return Boolean(
     status &&
     status.ok &&
-    status.mo2 &&
-    status.mo2.exists &&
-    status.mo2.llPluginInstalled &&
     status.downloads &&
     status.downloads.exists &&
     status.cookies &&
@@ -65,6 +70,7 @@ async function checkStatus() {
   if (!response || !response.ok) {
     setRow(rows.native, "bad", "Native app is not installed or not reachable.");
     setRow(rows.mo2, "bad", "Unavailable until native bridge works.");
+    setRow(rows.active, "bad", "Unavailable until native bridge works.");
     setRow(rows.downloads, "bad", "Unavailable until native bridge works.");
     setRow(rows.cookies, "bad", "Unavailable until native bridge works.");
     readyText.textContent = "Not ready";
@@ -74,13 +80,38 @@ async function checkStatus() {
 
   setRow(rows.native, "ok", response.nativeApp.baseDir);
 
-  if (response.mo2.exists && response.mo2.llPluginInstalled) {
-    setRow(rows.mo2, "ok", response.mo2.llPluginPath);
+  const activePluginPath = response.mo2.activePluginPath || "";
+  const hasNativeActiveFields = Boolean(response.mo2.activeInstancePath || activePluginPath);
+  const pluginPath = activePluginPath || response.mo2.llPluginPath || "";
+  if (activePluginPath || (response.mo2.exists && response.mo2.llPluginInstalled)) {
+    setRow(
+      rows.mo2,
+      "ok",
+      activePluginPath || (
+        hasNativeActiveFields
+          ? pluginPath
+          : "Plugin installed; active target is shown below."
+      )
+    );
   } else if (response.mo2.exists) {
     setRow(rows.mo2, "warn", "MO2 found, but LL plugin is not installed.");
+  } else if (response.downloads.exists) {
+    setRow(rows.mo2, "ok", "Plugin status unavailable; target is synced below.");
   } else {
     setRow(rows.mo2, "bad", "ModOrganizer.exe was not found.");
   }
+
+  const activeTarget = activeTargetSummary(response);
+  const hasTargetDownloads = Boolean(response.downloads && response.downloads.exists);
+  setRow(
+    rows.active,
+    activeTarget || hasTargetDownloads ? "ok" : "warn",
+    activeTarget || (
+      hasTargetDownloads
+        ? "Synced through target downloads below."
+        : "Open MO2 with LL Integration installed to sync the active target."
+    )
+  );
 
   setRow(
     rows.downloads,

@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox
 APP_NAME = "LLIntegration"
 NATIVE_NAME = "ll_integration_native"
 FIREFOX_EXTENSION_IDS = [
+    "ll-integration-release@nm088.dev",
     "ll-integration-firefox@nm088.dev",
     "ll-integration@nm088.dev",
 ]

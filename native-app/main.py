@@ -169,6 +169,7 @@ def ll_ini_lines(event, archive_path=None, browser_download_url=None, completed_
         f"archive_path={ini_value(archive_path)}",
         f"browser_download_url={ini_value(browser_download_url)}",
         f"completed_at={ini_value(completed_at)}",
+        f"update_mode={'skip' if is_external else 'manual'}",
         f"fixed_version={'true' if is_external else 'false'}",
         f"manual_update={'true' if is_external else 'false'}",
         f"skip_update_check={'true' if is_external else 'false'}",
@@ -227,6 +228,10 @@ def status_payload():
     plugin_path = plugins_path / "ll_integration" if plugins_path else Path("")
     downloads_path = Path(str(config.get("mo2_downloads_path") or ""))
     metadata_path = Path(str(config.get("metadata_path") or ""))
+    active_instance_path = Path(str(config.get("active_mo2_instance_path") or ""))
+    active_plugin_path = Path(str(config.get("active_mo2_plugin_path") or ""))
+    active_game = str(config.get("active_mo2_game") or "").strip()
+    active_synced_at = str(config.get("active_mo2_synced_at") or "").strip()
 
     return {
         "ok": True,
@@ -242,6 +247,12 @@ def status_payload():
             "pluginsPathExists": plugins_path.exists(),
             "llPluginPath": str(plugin_path),
             "llPluginInstalled": plugin_path.exists(),
+            "activeInstancePath": str(active_instance_path),
+            "activeInstanceExists": active_instance_path.exists(),
+            "activePluginPath": str(active_plugin_path),
+            "activePluginInstalled": active_plugin_path.exists(),
+            "activeGame": active_game,
+            "activeSyncedAt": active_synced_at,
         },
         "downloads": {
             "path": str(downloads_path),

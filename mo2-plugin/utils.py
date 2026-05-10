@@ -17,7 +17,7 @@ COOKIE_NAMES = {
     "ips4_login_key",
 }
 QUICK_HASH_CHUNK_SIZE = 1024 * 1024
-VERSION_RE = r"\bv?(\d+(?:[.-]\d+){1,3})(?:\b|(?=\D))"
+VERSION_RE = r"(?<!\d)v?(\d+(?:[.-]\d+){1,3})(?:\b|(?=\D))"
 
 
 @dataclass(frozen=True)

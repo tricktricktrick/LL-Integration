@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QToolBar, QToolButton, QW
 
 ACTION_OBJECT_NAME = "llIntegrationExperimentalToolbarAction"
 ACTION_MARKER = "_ll_integration_toolbar_action"
+RETRY_DELAYS_MS = (250, 1000, 2500, 5000, 10000, 20000)
 
 
 def install_toolbar_button(
@@ -42,15 +43,32 @@ def install_toolbar_button(
             write_log("toolbar experiment: no main window")
             return False
 
-        if hasattr(window, ACTION_MARKER):
-            write_log("toolbar experiment: action already installed")
-            return True
-
         toolbar = _find_toolbar(window)
         if toolbar is None:
             write_log("toolbar experiment: no QToolBar found")
             _dump_widget_hints(window, write_log)
             return False
+
+        existing_action = _deduplicate_existing_actions(window, toolbar, write_log)
+        if existing_action is not None:
+            setattr(window, ACTION_MARKER, existing_action)
+            write_log("toolbar experiment: existing action reused")
+            return True
+
+        existing = getattr(window, ACTION_MARKER, None)
+        if existing is not None and existing in toolbar.actions():
+            write_log("toolbar experiment: action already installed")
+            return True
+        if existing is not None:
+            write_log("toolbar experiment: stale action marker found; reinstalling")
+            try:
+                toolbar.removeAction(existing)
+            except Exception:
+                pass
+            try:
+                delattr(window, ACTION_MARKER)
+            except Exception:
+                pass
 
         action = QAction(QIcon(str(icon_path)), "LL Integration", toolbar)
         action.setObjectName(ACTION_OBJECT_NAME)
@@ -73,16 +91,66 @@ def install_toolbar_button(
     if attempt():
         return
 
-    # MO2 can finish wiring its main window shortly after plugin init.
-    for delay_ms in (250, 1000, 2500):
+    # MO2 can finish wiring or rebuild its main toolbar after plugin init/profile
+    # setup. Keep this best-effort and let the stable Tools menu remain primary.
+    for delay_ms in RETRY_DELAYS_MS:
         QTimer.singleShot(delay_ms, attempt)
 
 
-def _find_toolbar(main_window) -> QToolBar | None:
+def _all_toolbars(main_window) -> list[QToolBar]:
     if isinstance(main_window, QMainWindow):
-        toolbars = main_window.findChildren(QToolBar)
-    else:
-        toolbars = main_window.findChildren(QToolBar) if hasattr(main_window, "findChildren") else []
+        return main_window.findChildren(QToolBar)
+    if hasattr(main_window, "findChildren"):
+        return main_window.findChildren(QToolBar)
+    return []
+
+
+def _deduplicate_existing_actions(
+    main_window,
+    preferred_toolbar: QToolBar,
+    write_log: Callable[[str], None],
+) -> QAction | None:
+    matches = []
+    for toolbar in _all_toolbars(main_window):
+        for action in toolbar.actions():
+            if action.objectName() == ACTION_OBJECT_NAME:
+                matches.append((toolbar, action))
+
+    if not matches:
+        return None
+
+    kept_toolbar, kept_action = _choose_existing_action(matches, preferred_toolbar)
+    removed = 0
+    for toolbar, action in matches:
+        if action is kept_action:
+            continue
+        try:
+            toolbar.removeAction(action)
+            action.deleteLater()
+            removed += 1
+        except Exception as exc:
+            write_log(f"toolbar experiment: duplicate removal failed: {exc}")
+
+    write_log(
+        "toolbar experiment: found existing action "
+        f"toolbar={kept_toolbar.objectName() or '<unnamed toolbar>'} "
+        f"duplicates_removed={removed}"
+    )
+    return kept_action
+
+
+def _choose_existing_action(
+    matches: list[tuple[QToolBar, QAction]],
+    preferred_toolbar: QToolBar,
+) -> tuple[QToolBar, QAction]:
+    for toolbar, action in matches:
+        if toolbar is preferred_toolbar:
+            return toolbar, action
+    return matches[0]
+
+
+def _find_toolbar(main_window) -> QToolBar | None:
+    toolbars = _all_toolbars(main_window)
 
     visible = [toolbar for toolbar in toolbars if toolbar.isVisible()]
     candidates = visible or toolbars

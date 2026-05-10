@@ -1,4 +1,38 @@
-const ext = globalThis.browser || globalThis.chrome;
+function sendExtensionMessage(message) {
+  if (globalThis.__llIntegrationContextInvalidated) {
+    return false;
+  }
+
+  const api =
+    (typeof chrome !== "undefined" && chrome && chrome.runtime && chrome.runtime.sendMessage && chrome) ||
+    (typeof browser !== "undefined" && browser && browser.runtime && browser.runtime.sendMessage && browser) ||
+    (globalThis.chrome && globalThis.chrome.runtime && globalThis.chrome.runtime.sendMessage && globalThis.chrome) ||
+    (globalThis.browser && globalThis.browser.runtime && globalThis.browser.runtime.sendMessage && globalThis.browser);
+
+  if (!api) {
+    console.error("LL Integration runtime API is not available in this content script.", {
+      hasChrome: typeof chrome !== "undefined",
+      hasBrowser: typeof browser !== "undefined",
+      hasGlobalChrome: Boolean(globalThis.chrome),
+      hasGlobalBrowser: Boolean(globalThis.browser),
+    });
+    return;
+  }
+
+  try {
+    api.runtime.sendMessage(message);
+    return true;
+  } catch (error) {
+    const messageText = String((error && error.message) || error || "");
+    if (messageText.toLowerCase().includes("extension context invalidated")) {
+      globalThis.__llIntegrationContextInvalidated = true;
+      console.warn("LL Integration was reloaded while this page was open. Reload the LoversLab page before downloading.");
+    } else {
+      console.error("LL Integration could not send download click to background.", error);
+    }
+    return false;
+  }
+}
 
 function textOrNull(root, selector) {
   const element = root.querySelector(selector);
@@ -58,7 +92,7 @@ document.addEventListener("click", (event) => {
     pageTitleFallback();
   const meta = textOrNull(item, ".ipsDataItem_meta");
 
-  ext.runtime.sendMessage({
+  sendExtensionMessage({
     action: "ll_download_clicked",
     pageUrl: window.location.href,
     download: {

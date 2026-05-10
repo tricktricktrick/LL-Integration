@@ -4,6 +4,8 @@ const ARCHIVE_EXTENSIONS = [".7z", ".zip", ".rar"];
 const PENDING_LL_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 const EXTERNAL_CAPTURE_TIMEOUT_MS = 5 * 60 * 1000;
 const EXTERNAL_CAPTURE_GRACE_MS = 60 * 1000;
+const DOWNLOAD_LOOKUP_RETRIES = 8;
+const DOWNLOAD_LOOKUP_DELAY_MS = 250;
 
 function callbackPromise(call) {
   return new Promise((resolve, reject) => {
@@ -34,6 +36,10 @@ function getDownloads(query) {
   return callbackPromise(done => ext.downloads.search(query, done));
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function getTab(tabId) {
   return callbackPromise(done => ext.tabs.get(tabId, done));
 }
@@ -45,6 +51,33 @@ function getCookies(details) {
 function isArchivePath(path) {
   const lower = (path || "").toLowerCase();
   return ARCHIVE_EXTENSIONS.some(extName => lower.endsWith(extName));
+}
+
+function extractVersion(name) {
+  if (!name) {
+    return "";
+  }
+
+  const stem = String(name).replace(/\.(7z|zip|rar|tar|gz|bz2|xz)$/i, "");
+  const match = stem.match(/(?<!\d)v?(\d+(?:[.-]\d+){1,3})(?:\b|(?=\D))/i);
+  return match ? match[1].replace(/-/g, ".") : "";
+}
+
+async function findCompletedDownload(id) {
+  for (let attempt = 0; attempt < DOWNLOAD_LOOKUP_RETRIES; attempt += 1) {
+    const items = await getDownloads({ id });
+    const item = items && items[0];
+    if (item && item.filename) {
+      console.log("Opera download lookup:", { id, attempt, filename: item.filename, state: item.state });
+      return item;
+    }
+    await sleep(DOWNLOAD_LOOKUP_DELAY_MS);
+  }
+
+  const items = await getDownloads({ id });
+  const item = items && items[0] ? items[0] : null;
+  console.log("Opera download lookup final:", { id, found: Boolean(item), filename: item && item.filename, state: item && item.state });
+  return item;
 }
 
 function sendNative(payload, okLog, errorLog) {
@@ -72,6 +105,26 @@ async function setExternalCaptureDownload(downloadId, captureSnapshot) {
   const downloads = await getExternalCaptureDownloads();
   downloads[String(downloadId)] = captureSnapshot;
   await storageSet({ externalCaptureDownloads: downloads });
+}
+
+async function setPendingDownloadPath(downloadId, archivePath) {
+  const state = await storageGet(["pendingDownloadPaths"]);
+  const paths = state.pendingDownloadPaths || {};
+  paths[String(downloadId)] = archivePath;
+  await storageSet({ pendingDownloadPaths: paths });
+}
+
+async function getPendingDownloadPath(downloadId) {
+  const state = await storageGet(["pendingDownloadPaths"]);
+  const paths = state.pendingDownloadPaths || {};
+  return paths[String(downloadId)] || "";
+}
+
+async function deletePendingDownloadPath(downloadId) {
+  const state = await storageGet(["pendingDownloadPaths"]);
+  const paths = state.pendingDownloadPaths || {};
+  delete paths[String(downloadId)];
+  await storageSet({ pendingDownloadPaths: paths });
 }
 
 async function getExternalCaptureDownload(downloadId) {
@@ -203,7 +256,8 @@ async function cancelPendingCapture() {
   await storageSet({
     lastLLDownloadEvent: null,
     externalArchiveCapture: null,
-    externalCaptureDownloads: {}
+    externalCaptureDownloads: {},
+    pendingDownloadPaths: {}
   });
   return { ok: true, cancelled: hadPending };
 }
@@ -245,7 +299,44 @@ async function eventForCompletedArchive(item) {
     return { kind: "ll", event: pendingLLDownload };
   }
 
+  const fallback = llEventFromCompletedDownload(item);
+  if (fallback) {
+    console.warn("Opera reconstructed LL event from completed download because no pending click event was available.", {
+      id: item.id,
+      url: item.finalUrl || item.url || "",
+      referrer: item.referrer || ""
+    });
+    return { kind: "ll", event: fallback };
+  }
+
   return null;
+}
+
+function llEventFromCompletedDownload(item) {
+  const downloadUrl = item.finalUrl || item.url || "";
+  const referrer = item.referrer || "";
+  if (!isLoversLabUrl(downloadUrl) && !isLoversLabUrl(referrer)) {
+    return null;
+  }
+
+  const archiveName = archiveNameFromPath(item.filename);
+  if (!archiveName || !isArchivePath(archiveName)) {
+    return null;
+  }
+
+  return {
+    action: "save_ll_download_event",
+    source: "opera",
+    capturedAt: new Date().toISOString(),
+    pageUrl: referrer || downloadUrl,
+    download: {
+      name: archiveName,
+      version: extractVersion(archiveName),
+      url: downloadUrl,
+      size: "",
+      date_iso: ""
+    }
+  };
 }
 
 async function shouldMarkExternalDownload(item) {
@@ -367,15 +458,18 @@ ext.downloads.onChanged.addListener(async (delta) => {
     return;
   }
 
-  const items = await getDownloads({ id: delta.id });
-  const item = items && items[0];
-  if (!item || !isArchivePath(item.filename)) {
+  const item = await findCompletedDownload(delta.id);
+  const archivePath = (item && item.filename) || await getPendingDownloadPath(delta.id);
+  if (!item || !isArchivePath(archivePath)) {
+    console.log("Opera completed download ignored:", { id: delta.id, found: Boolean(item), archivePath });
     await deleteExternalCaptureDownload(delta.id);
+    await deletePendingDownloadPath(delta.id);
     return;
   }
 
   const pending = await eventForCompletedArchive(item);
   if (!pending) {
+    console.log("Opera completed archive has no pending LL/capture event:", { id: delta.id, archivePath });
     return;
   }
 
@@ -383,7 +477,7 @@ ext.downloads.onChanged.addListener(async (delta) => {
     action: "save_ll_download_completed",
     source: "opera",
     completedAt: new Date().toISOString(),
-    archivePath: item.filename,
+    archivePath,
     browserDownloadUrl: item.finalUrl || item.url || "",
     event: pending.event
   };
@@ -408,9 +502,14 @@ ext.downloads.onChanged.addListener(async (delta) => {
       }
     }
   }
+  await deletePendingDownloadPath(item.id);
 });
 
 ext.downloads.onCreated.addListener(async (item) => {
+  if (item && item.id != null && isArchivePath(item.filename)) {
+    await setPendingDownloadPath(item.id, item.filename);
+  }
+
   const captureSnapshot = await shouldMarkExternalDownload(item);
   if (!captureSnapshot) {
     return;

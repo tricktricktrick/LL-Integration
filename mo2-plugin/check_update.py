@@ -2,6 +2,7 @@ import argparse
 import configparser
 import fnmatch
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import List, Optional
@@ -32,6 +33,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_COOKIES = ROOT_DIR / "native-app" / "cookies_storage" / "cookies_ll.json"
 DEFAULT_INI = Path(__file__).resolve().parent / "LL.sample.ini"
 DEFAULT_OUT = Path(__file__).resolve().parent / "update_check.json"
+VERSION_MARKERS = ("{version}", "{v}", "<version>", "<v>")
 
 
 def read_ll_ini(path: Path) -> configparser.SectionProxy:
@@ -66,9 +68,10 @@ def download_page_url(config: configparser.SectionProxy) -> str:
 def score_candidate(download: LLDownload, known_file: str) -> int:
     score = 0
     pattern = known_file.strip()
-    if any(char in pattern for char in "*?[]"):
+    match_pattern = version_marker_match_pattern(pattern)
+    if any(char in match_pattern for char in "*?[]"):
         lower_name = download.name.lower()
-        lower_pattern = pattern.lower()
+        lower_pattern = match_pattern.lower()
         if fnmatch.fnmatch(lower_name, lower_pattern):
             score += 130
         elif fnmatch.fnmatch(lower_name, f"*{lower_pattern}*"):
@@ -91,17 +94,117 @@ def score_candidate(download: LLDownload, known_file: str) -> int:
     return score
 
 
+def version_marker_match_pattern(pattern: str) -> str:
+    match_pattern = str(pattern or "")
+    for marker in VERSION_MARKERS:
+        match_pattern = match_pattern.replace(marker, "*")
+    return match_pattern
+
+
+def strip_archive_extension(value: str) -> str:
+    return re.sub(r"\.(?:7z|zip|rar|tar|gz|bz2|xz)$", "", str(value or ""), flags=re.IGNORECASE)
+
+
+def has_archive_extension(value: str) -> bool:
+    return bool(re.search(r"\.(?:7z|zip|rar|tar|gz|bz2|xz)$", str(value or ""), flags=re.IGNORECASE))
+
+
+def version_marker_version(file_name: str, pattern: str) -> Optional[str]:
+    pattern = pattern.strip()
+    if not any(item in pattern for item in VERSION_MARKERS):
+        return None
+
+    def build_regex(source_pattern: str) -> tuple[str, bool]:
+        regex = ""
+        index = 0
+        group_added = False
+        while index < len(source_pattern):
+            marker = next((item for item in VERSION_MARKERS if source_pattern.startswith(item, index)), "")
+            if marker:
+                regex += "(.+?)"
+                index += len(marker)
+                group_added = True
+                continue
+
+            char = source_pattern[index]
+            regex += ".*?" if char == "*" else re.escape(char)
+            index += 1
+        return regex, group_added
+
+    regex, group_added = build_regex(pattern)
+    if not group_added:
+        return None
+
+    match = None
+    if has_archive_extension(pattern):
+        match = re.fullmatch(regex, file_name, flags=re.IGNORECASE)
+
+    if not match:
+        stem_regex, _group_added = build_regex(strip_archive_extension(pattern))
+        match = re.fullmatch(stem_regex, strip_archive_extension(file_name), flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    value = ".".join(part for group in match.groups() for part in re.findall(r"\d+", group))
+    return value or None
+
+
+def wildcard_version(file_name: str, pattern: str) -> Optional[str]:
+    marked = version_marker_version(file_name, pattern)
+    if marked:
+        return marked
+
+    pattern = pattern.strip()
+    if "*" not in pattern:
+        return None
+
+    file_stem = strip_archive_extension(file_name)
+    pattern_stem = strip_archive_extension(pattern)
+    regex = ""
+    group_count = 0
+    for char in pattern_stem:
+        if char == "*":
+            group_count += 1
+            regex += "(.*?)"
+        else:
+            regex += re.escape(char)
+
+    match = re.fullmatch(regex, file_stem, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    parts = []
+    for value in match.groups():
+        digits = re.findall(r"\d+", value)
+        if digits:
+            parts.extend(digits)
+
+    return ".".join(parts) if parts else None
+
+
+def candidate_version(download: LLDownload, known_file: str) -> Optional[str]:
+    return download.version or wildcard_version(download.name, known_file)
+
+
 def choose_latest(downloads: List[LLDownload], known_file: str) -> Optional[LLDownload]:
     scored = [
-        (score_candidate(download, known_file), download)
+        (score_candidate(download, known_file), download, candidate_version(download, known_file))
         for download in downloads
-        if download.version
     ]
-    scored = [item for item in scored if item[0] >= 80]
+    scored = [item for item in scored if item[0] >= 80 and item[2]]
     if not scored:
         return None
 
-    return max(scored, key=lambda item: (item[0], version_key(item[1].version or "0")))[1]
+    _score, download, version = max(scored, key=lambda item: (item[0], version_key(item[2] or "0")))
+    if download.version == version:
+        return download
+    return LLDownload(
+        name=download.name,
+        url=download.url,
+        size=download.size,
+        date_iso=download.date_iso,
+        version=version,
+    )
 
 
 def load_html(args: argparse.Namespace, config: configparser.SectionProxy) -> tuple[str, str]:
@@ -139,8 +242,6 @@ def check_ini_for_updates(
 
     if not known_file:
         raise RuntimeError("LL metadata needs file_name")
-    if not current_version:
-        raise RuntimeError("LL metadata needs version")
 
     class Args:
         pass
@@ -153,7 +254,7 @@ def check_ini_for_updates(
     downloads = extract_downloads(html)
     latest = choose_latest(downloads, known_file)
     latest_version = latest.version if latest else None
-    comparison = compare_versions(latest_version, current_version) if latest_version else None
+    comparison = compare_versions(latest_version, current_version) if latest_version and current_version else None
 
     payload = {
         "sourceUrl": source_url,
