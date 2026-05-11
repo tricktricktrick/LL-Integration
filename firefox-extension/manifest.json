@@ -44,7 +44,7 @@
     },
     "browser_specific_settings": {
         "gecko": {
-            "id": "ll-integration-release@nm088.dev",
+            "id": "ll-integration-firefox@nm088.dev",
             "data_collection_permissions": {
                 "required": [
                     "authenticationInfo",
