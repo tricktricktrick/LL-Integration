@@ -4,6 +4,7 @@ const refreshButton = document.getElementById("refreshButton");
 const exportButton = document.getElementById("exportButton");
 const captureButton = document.getElementById("captureButton");
 const cancelButton = document.getElementById("cancelButton");
+const monitorButton = document.getElementById("monitorButton");
 
 const rows = {
   native: document.getElementById("nativeStatus"),
@@ -187,9 +188,50 @@ async function cancelPending() {
   await checkStatus();
 }
 
+async function openMonitor() {
+  const originalText = monitorButton.textContent;
+  monitorButton.disabled = true;
+  monitorButton.textContent = "Opening...";
+  setMessage("Opening floating controls. First launch can take a few seconds.");
+
+  try {
+    let tab = null;
+    try {
+      const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+      tab = tabs && tabs[0] ? tabs[0] : null;
+    } catch (_error) {
+      tab = null;
+    }
+
+    const response = await browser.runtime.sendMessage({
+      action: "popup_open_monitor",
+      targetTab: tab
+        ? {
+            id: tab.id,
+            url: tab.url || "",
+            title: tab.title || ""
+          }
+        : null
+    });
+
+    if (!response || !response.ok) {
+      setMessage(response && response.error ? response.error : "Could not open floating controls.");
+      return;
+    }
+
+    setMessage(response.closed ? "Floating controls closed." : "Floating controls opened. Arm follows the active tab.");
+  } catch (error) {
+    setMessage(`Could not open floating controls: ${error}`);
+  } finally {
+    monitorButton.disabled = false;
+    monitorButton.textContent = originalText;
+  }
+}
+
 refreshButton.addEventListener("click", checkStatus);
 exportButton.addEventListener("click", exportCookies);
 captureButton.addEventListener("click", captureCurrentPage);
 cancelButton.addEventListener("click", cancelPending);
+monitorButton.addEventListener("click", openMonitor);
 
 checkStatus();

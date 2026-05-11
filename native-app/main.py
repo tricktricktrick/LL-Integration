@@ -1,6 +1,8 @@
 import json
+import os
 import re
 import shutil
+import subprocess
 import struct
 import sys
 import hashlib
@@ -16,6 +18,7 @@ OUT_FILE = BASE_DIR / "cookies_storage" / "cookies_ll.json"
 DOWNLOAD_EVENTS_FILE = BASE_DIR / "downloads_storage" / "download_events.json"
 DOWNLOAD_COMPLETIONS_FILE = BASE_DIR / "downloads_storage" / "download_completions.json"
 LATEST_INI_FILE = BASE_DIR / "downloads_storage" / "latest_ll_download.ini"
+FLOATING_CONTROLS_STATE_FILE = BASE_DIR / "floating_controls" / "state.json"
 ARCHIVE_SUFFIXES = {".7z", ".zip", ".rar"}
 QUICK_HASH_CHUNK_SIZE = 1024 * 1024
 DEFAULT_CONFIG = {
@@ -24,12 +27,13 @@ DEFAULT_CONFIG = {
     "metadata_path": str(BASE_DIR / "metadata"),
     "copy_archives_to_mo2_downloads": True,
     "overwrite_existing_downloads": True,
+    "floating_controls_enabled": False,
 }
 
 def read_message():
     raw_len = sys.stdin.buffer.read(4)
     if not raw_len:
-        sys.exit(0)
+        return None
 
     msg_len = struct.unpack("@I", raw_len)[0]
     return json.loads(sys.stdin.buffer.read(msg_len).decode("utf-8"))
@@ -43,6 +47,12 @@ def send_message(message):
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def save_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temp.replace(path)
 
 def load_config():
     if not CONFIG_FILE.exists():
@@ -70,6 +80,19 @@ def load_json_list(path):
 
     return data if isinstance(data, list) else []
 
+def load_json_object(path, default=None):
+    if default is None:
+        default = {}
+    if not path.exists():
+        return default.copy()
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default.copy()
+
+    return data if isinstance(data, dict) else default.copy()
+
 def ini_value(value):
     if value is None:
         return ""
@@ -89,6 +112,156 @@ def ll_resource_id(download_url):
     query = parse_qs(urlparse(download_url).query)
     values = query.get("r")
     return values[0] if values else ""
+
+def source_type_for_event(event):
+    source_type = str(event.get("sourceType") or "").strip().lower()
+    if source_type:
+        return source_type
+    if event.get("action") == "capture_external_archive":
+        return "external"
+    page_url = str(event.get("pageUrl") or "")
+    host = urlparse(page_url).hostname or ""
+    if host == "dwemermods.com" or host.endswith(".dwemermods.com"):
+        return "dwemermods"
+    return "loverslab"
+
+def source_update_supported(source_type):
+    return source_type == "loverslab"
+
+def floating_controls_default_state():
+    return {
+        "seq": 0,
+        "command": "",
+        "follow": False,
+        "armed": False,
+        "visible": False,
+        "label": "Idle",
+    }
+
+def floating_controls_state():
+    state = floating_controls_default_state()
+    state.update(load_json_object(FLOATING_CONTROLS_STATE_FILE, state))
+    return state
+
+def write_floating_controls_state(update):
+    state = floating_controls_state()
+    state.update(update)
+    save_json_atomic(FLOATING_CONTROLS_STATE_FILE, state)
+    return state
+
+def process_is_running(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            process_query_limited_information = 0x1000
+            still_active = 259
+            handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+def overlay_launcher():
+    overlay_exe = BASE_DIR / "ll_integration_overlay.exe"
+    if overlay_exe.exists():
+        return [str(overlay_exe)]
+
+    overlay_py = BASE_DIR / "overlay.py"
+    if overlay_py.exists():
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        python = pythonw if pythonw.exists() else Path(sys.executable)
+        return [str(python), str(overlay_py)]
+
+    return None
+
+def open_floating_controls():
+    config = load_config()
+    if not config.get("floating_controls_enabled", False):
+        return {
+            "ok": False,
+            "error": "Floating Capture Controls are not installed/enabled. Run the installer and enable the optional floating controls.",
+            "disabled": True,
+        }
+
+    launcher = overlay_launcher()
+    if not launcher:
+        return {"ok": False, "error": "Floating Capture Controls were not found in the native app folder."}
+
+    state = floating_controls_state()
+    overlay_running = process_is_running(state.get("pid"))
+    if state.get("visible") and not overlay_running:
+        state = write_floating_controls_state({
+            "visible": False,
+            "pid": "",
+            "armed": False,
+            "label": "Idle",
+        })
+        overlay_running = False
+
+    if state.get("visible"):
+        update = {
+            "seq": int(state.get("seq") or 0) + 1,
+            "command": "close",
+            "visible": False,
+            "armed": False,
+            "follow": False,
+            "label": "Idle",
+        }
+        if overlay_running:
+            update["pid"] = state.get("pid")
+        else:
+            update["pid"] = ""
+        state = write_floating_controls_state(update)
+        return {"ok": True, "closed": True, "disarmed": True, "state": state}
+
+    if overlay_running:
+        state = write_floating_controls_state({
+            "seq": int(state.get("seq") or 0) + 1,
+            "command": "show",
+            "visible": True,
+            "pid": state.get("pid"),
+            "label": state.get("label") or "Idle",
+        })
+        return {"ok": True, "reused": True, "state": state}
+
+    try:
+        process = subprocess.Popen(
+            launcher,
+            cwd=str(BASE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    state = write_floating_controls_state({"command": "", "visible": True, "pid": process.pid, "label": "Idle"})
+    return {"ok": True, "state": state}
 
 def archive_quick_hash(path):
     size = path.stat().st_size
@@ -145,8 +318,8 @@ def ll_ini_lines(event, archive_path=None, browser_download_url=None, completed_
     archive = Path(archive_path) if archive_path else None
     archive_size = archive.stat().st_size if archive and archive.exists() else ""
     quick_hash = archive_quick_hash(archive) if archive and archive.exists() else ""
-    source_type = event.get("sourceType") or ("external" if event.get("action") == "capture_external_archive" else "loverslab")
-    is_external = source_type == "external"
+    source_type = source_type_for_event(event)
+    update_supported = source_update_supported(source_type)
     file_name = download.get("name") or (archive.name if archive else "")
     download_url = download.get("url") or browser_download_url or ""
     return [
@@ -169,10 +342,10 @@ def ll_ini_lines(event, archive_path=None, browser_download_url=None, completed_
         f"archive_path={ini_value(archive_path)}",
         f"browser_download_url={ini_value(browser_download_url)}",
         f"completed_at={ini_value(completed_at)}",
-        f"update_mode={'skip' if is_external else 'manual'}",
-        f"fixed_version={'true' if is_external else 'false'}",
-        f"manual_update={'true' if is_external else 'false'}",
-        f"skip_update_check={'true' if is_external else 'false'}",
+        f"update_mode={'manual' if update_supported else 'skip'}",
+        f"fixed_version={'false' if update_supported else 'true'}",
+        f"manual_update={'false' if update_supported else 'true'}",
+        f"skip_update_check={'false' if update_supported else 'true'}",
         "",
     ]
 
@@ -197,7 +370,7 @@ def write_sidecar_files(archive_path, event, browser_download_url, completed_at)
     metadata_ini_path = metadata_downloads / f"{archive.name}.ll.ini"
     metadata_json_path = metadata_downloads / f"{archive.name}.ll.json"
     payload = {
-        "sourceType": event.get("sourceType") or ("external" if event.get("action") == "capture_external_archive" else "loverslab"),
+        "sourceType": source_type_for_event(event),
         "llFileId": ll_file_id(event.get("pageUrl")),
         "llResourceId": ll_resource_id((event.get("download") or {}).get("url") or browser_download_url),
         "archiveName": archive.name,
@@ -272,6 +445,11 @@ def status_payload():
             "iniPath": str(LATEST_INI_FILE),
             "exists": LATEST_INI_FILE.exists(),
         },
+        "floatingControls": {
+            "enabled": bool(config.get("floating_controls_enabled", False)),
+            "statePath": str(FLOATING_CONTROLS_STATE_FILE),
+            "overlayExists": bool((BASE_DIR / "ll_integration_overlay.exe").exists() or (BASE_DIR / "overlay.py").exists()),
+        },
     }
 
 def handle_message(msg):
@@ -321,11 +499,32 @@ def handle_message(msg):
             "copyError": copy_error,
         }
 
+    if msg.get("action") == "open_floating_controls":
+        return open_floating_controls()
+
+    if msg.get("action") == "floating_controls_state":
+        return {"ok": True, "state": floating_controls_state()}
+
+    if msg.get("action") == "floating_controls_status":
+        update = {}
+        for key in ("armed", "follow", "label", "visible"):
+            if key in msg:
+                update[key] = msg.get(key)
+        return {"ok": True, "state": write_floating_controls_state(update)}
+
     return {"ok": False, "error": "Unknown action"}
 
 def main():
-    msg = read_message()
-    send_message(handle_message(msg))
+    while True:
+        msg = read_message()
+        if msg is None:
+            return
+
+        response = handle_message(msg)
+        request_id = msg.get("requestId")
+        if request_id is not None and isinstance(response, dict):
+            response["requestId"] = request_id
+        send_message(response)
 
 if __name__ == "__main__":
     main()

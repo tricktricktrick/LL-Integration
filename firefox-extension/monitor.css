@@ -7,7 +7,7 @@
 
 body {
   margin: 0;
-  min-width: 330px;
+  min-width: 340px;
 }
 
 main {
@@ -48,41 +48,6 @@ p {
   font-size: 12px;
 }
 
-.status-list {
-  display: grid;
-  gap: 8px;
-}
-
-.status {
-  display: grid;
-  grid-template-columns: 12px 1fr;
-  gap: 10px;
-  align-items: center;
-  padding: 8px;
-  border: 1px solid #383f3b;
-  border-radius: 6px;
-  background: #292d30;
-}
-
-.dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #69716d;
-}
-
-.status.ok .dot {
-  background: #3ee681;
-}
-
-.status.warn .dot {
-  background: #e6c23e;
-}
-
-.status.bad .dot {
-  background: #f25e5e;
-}
-
 strong {
   display: block;
   font-size: 12px;
@@ -90,7 +55,6 @@ strong {
 
 small {
   display: block;
-  margin-top: 2px;
   color: #aeb8b1;
   font-size: 11px;
   word-break: break-word;
@@ -98,13 +62,9 @@ small {
 
 .actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 8px;
   margin-top: 12px;
-}
-
-.single-action {
-  grid-template-columns: 1fr;
 }
 
 button {
@@ -120,34 +80,29 @@ button:hover {
   background: #3d5447;
 }
 
-#exportButton {
+button:disabled {
+  opacity: 0.45;
+}
+
+#armButton {
   border-color: #2fc777;
   background: #17613b;
 }
 
-#captureButton {
-  border-color: #2fc777;
-  background: #17613b;
-}
-
-#cancelButton {
+#disarmButton {
   border-color: #704545;
   background: #513237;
 }
 
-#monitorButton {
+#followButton {
   border-color: #5f6f8f;
   background: #33415f;
 }
 
-button:disabled {
-  opacity: 0.45;
-  cursor: wait;
-}
-
 .message {
-  min-height: 16px;
+  min-height: 34px;
   margin-top: 10px;
   color: #aeb8b1;
   font-size: 11px;
+  word-break: break-word;
 }

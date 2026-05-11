@@ -89,6 +89,20 @@ Invoke-Checked {
 
 Copy-Item -LiteralPath "dist\ll_integration_native.exe" -Destination "native-app\ll_integration_native.exe" -Force
 
+Write-Host "Building floating capture controls..."
+Remove-IfExists "dist\ll_integration_overlay.exe"
+Invoke-Checked {
+    & $Python -m PyInstaller `
+        --noconfirm `
+        --clean `
+        --onefile `
+        --windowed `
+        --name "ll_integration_overlay" `
+        "native-app\overlay.py"
+} "Floating controls build"
+
+Copy-Item -LiteralPath "dist\ll_integration_overlay.exe" -Destination "native-app\ll_integration_overlay.exe" -Force
+
 $commonInstallerArgs = @(
     "--noconfirm",
     "--clean",
@@ -113,7 +127,9 @@ Invoke-Checked {
 } "WithToolbar installer build"
 
 Remove-Item -LiteralPath "native-app\ll_integration_native.exe" -Force
+Remove-Item -LiteralPath "native-app\ll_integration_overlay.exe" -Force
 Remove-IfExists "dist\ll_integration_native.exe"
+Remove-IfExists "dist\ll_integration_overlay.exe"
 
 Write-Host "Packaging Opera/Chromium extension..."
 New-ExtensionZip `

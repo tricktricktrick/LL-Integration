@@ -6,6 +6,18 @@ const EXTERNAL_CAPTURE_TIMEOUT_MS = 5 * 60 * 1000;
 const EXTERNAL_CAPTURE_GRACE_MS = 60 * 1000;
 const DOWNLOAD_LOOKUP_RETRIES = 8;
 const DOWNLOAD_LOOKUP_DELAY_MS = 250;
+const NATIVE_MESSAGE_TIMEOUT_MS = 8000;
+let monitorWindowId = null;
+let monitorTabId = null;
+let floatingControlsTimer = null;
+let floatingControlsLastSeq = 0;
+let floatingControlsFollow = false;
+let floatingControlsPollInFlight = false;
+let floatingControlsSyncInFlight = false;
+let floatingControlsPort = null;
+let floatingControlsNextRequestId = 1;
+let floatingControlsTargetTab = null;
+const floatingControlsRequests = new Map();
 
 function callbackPromise(call) {
   return new Promise((resolve, reject) => {
@@ -82,7 +94,21 @@ async function findCompletedDownload(id) {
 
 function sendNative(payload, okLog, errorLog) {
   return new Promise((resolve) => {
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({ ok: false, error: "Native messaging timed out." });
+    }, NATIVE_MESSAGE_TIMEOUT_MS);
+
     ext.runtime.sendNativeMessage("ll_integration_native", payload, (response) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutId);
       const error = ext.runtime.lastError;
       if (error) {
         console.error(errorLog, error.message || String(error));
@@ -94,6 +120,329 @@ function sendNative(payload, okLog, errorLog) {
       resolve(response || { ok: false, error: "Native bridge returned no response." });
     });
   });
+}
+
+function rejectFloatingControlsRequests(error) {
+  for (const pending of floatingControlsRequests.values()) {
+    clearTimeout(pending.timeoutId);
+    pending.reject(error);
+  }
+  floatingControlsRequests.clear();
+}
+
+function floatingControlsNativePort() {
+  if (floatingControlsPort) {
+    return floatingControlsPort;
+  }
+
+  floatingControlsPort = ext.runtime.connectNative("ll_integration_native");
+  floatingControlsPort.onMessage.addListener((response) => {
+    const requestId = response && response.requestId;
+    const pending = floatingControlsRequests.get(requestId);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timeoutId);
+    floatingControlsRequests.delete(requestId);
+    pending.resolve(response);
+  });
+  floatingControlsPort.onDisconnect.addListener(() => {
+    const error = ext.runtime.lastError
+      ? new Error(ext.runtime.lastError.message)
+      : new Error("Floating controls native port disconnected.");
+    floatingControlsPort = null;
+    rejectFloatingControlsRequests(error);
+    stopFloatingControlsPolling();
+  });
+  return floatingControlsPort;
+}
+
+function floatingControlsNativeRequest(payload) {
+  return new Promise((resolve, reject) => {
+    const requestId = floatingControlsNextRequestId++;
+    const timeoutId = setTimeout(() => {
+      floatingControlsRequests.delete(requestId);
+      if (floatingControlsPort) {
+        try {
+          floatingControlsPort.disconnect();
+        } catch (_error) {
+          // The port may already be gone.
+        }
+        floatingControlsPort = null;
+      }
+      reject(new Error("Floating controls native request timed out."));
+    }, NATIVE_MESSAGE_TIMEOUT_MS);
+
+    floatingControlsRequests.set(requestId, { resolve, reject, timeoutId });
+
+    try {
+      floatingControlsNativePort().postMessage({ ...payload, requestId });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      floatingControlsRequests.delete(requestId);
+      reject(error);
+    }
+  });
+}
+
+function isWebTab(tab) {
+  return Boolean(tab && tab.id != null && tab.url && /^https?:\/\//i.test(tab.url));
+}
+
+function rememberFloatingControlsTarget(tab) {
+  if (!isWebTab(tab)) {
+    return null;
+  }
+
+  floatingControlsTargetTab = {
+    id: tab.id,
+    url: tab.url,
+    title: tab.title || "",
+    lastAccessed: tab.lastAccessed || Date.now()
+  };
+  return floatingControlsTargetTab;
+}
+
+function webTabFromList(tabs) {
+  const candidates = (tabs || [])
+    .filter(isWebTab)
+    .sort((left, right) => (right.lastAccessed || 0) - (left.lastAccessed || 0));
+  return candidates[0] || null;
+}
+
+async function currentActiveWebTab() {
+  const focused = webTabFromList(await callbackPromise(done => ext.tabs.query({ active: true, lastFocusedWindow: true }, done)));
+  if (focused) {
+    return rememberFloatingControlsTarget(focused);
+  }
+
+  const active = webTabFromList(await callbackPromise(done => ext.tabs.query({ active: true }, done)));
+  return rememberFloatingControlsTarget(active);
+}
+
+async function tabById(tabId) {
+  try {
+    const tab = await getTab(tabId);
+    return isWebTab(tab) ? tab : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function armCaptureForTab(tab) {
+  if (!tab || tab.id == null || !tab.url || !/^https?:\/\//i.test(tab.url)) {
+    return null;
+  }
+  return setExternalArchiveCapture(tab.url, tab.title || "", tab.id);
+}
+
+async function retargetFloatingCapture(tab) {
+  const target = rememberFloatingControlsTarget(tab)
+    || await currentActiveWebTab()
+    || floatingControlsTargetTab;
+  if (!target) {
+    return null;
+  }
+  return armCaptureForTab(target);
+}
+
+async function floatingStatusLabel() {
+  const pending = await getPendingLLDownload();
+  if (pending && pending.download) {
+    return `Waiting: ${pending.download.name || "archive"}`;
+  }
+
+  const capture = await getExternalArchiveCapture();
+  if (capture) {
+    let label = capture.pageTitle || "";
+    if (!label) {
+      try {
+        label = new URL(capture.pageUrl).hostname;
+      } catch (_error) {
+        label = capture.pageUrl || "page";
+      }
+    }
+    return `${floatingControlsFollow ? "Follow armed" : "Armed"}: ${label}`;
+  }
+  return floatingControlsFollow ? "Follow idle" : "Idle";
+}
+
+async function syncFloatingControlsStatus(visible = true) {
+  if (floatingControlsSyncInFlight) {
+    return { ok: true, skipped: true };
+  }
+  floatingControlsSyncInFlight = true;
+  try {
+    const pending = await getPendingLLDownload();
+    const capture = await getExternalArchiveCapture();
+    return floatingControlsNativeRequest(
+      {
+        action: "floating_controls_status",
+        source: "opera",
+        armed: Boolean(pending || capture),
+        follow: floatingControlsFollow,
+        label: await floatingStatusLabel(),
+        visible
+      }
+    );
+  } finally {
+    floatingControlsSyncInFlight = false;
+  }
+}
+
+async function handleFloatingControlsCommand(state) {
+  const command = state.command || "";
+  if (!command) {
+    return;
+  }
+
+  if (command === "arm") {
+    floatingControlsFollow = true;
+    await retargetFloatingCapture();
+  } else if (command === "disarm") {
+    floatingControlsFollow = false;
+    await cancelPendingCapture();
+  } else if (command === "follow_on") {
+    floatingControlsFollow = true;
+    if (await getExternalArchiveCapture()) {
+      await retargetFloatingCapture();
+    }
+  } else if (command === "follow_off") {
+    floatingControlsFollow = false;
+  } else if (command === "close") {
+    floatingControlsFollow = false;
+    await cancelPendingCapture();
+    stopFloatingControlsPolling();
+    return false;
+  }
+  return true;
+}
+
+async function pollFloatingControls() {
+  if (floatingControlsPollInFlight) {
+    return;
+  }
+  floatingControlsPollInFlight = true;
+  try {
+    const response = await floatingControlsNativeRequest({ action: "floating_controls_state", source: "opera" });
+    if (!response || !response.ok || !response.state) {
+      return;
+    }
+
+    const state = response.state;
+    const seq = Number(state.seq || 0);
+    if (seq > floatingControlsLastSeq) {
+      floatingControlsLastSeq = seq;
+      const shouldSync = await handleFloatingControlsCommand(state);
+      if (shouldSync === false) {
+        return;
+      }
+    }
+    if (state.visible === false) {
+      stopFloatingControlsPolling();
+      return;
+    }
+    await syncFloatingControlsStatus(true);
+  } finally {
+    floatingControlsPollInFlight = false;
+  }
+}
+
+function startFloatingControlsPolling() {
+  if (floatingControlsTimer) {
+    return;
+  }
+  floatingControlsTimer = setInterval(() => {
+    pollFloatingControls().catch(error => console.error("Floating controls poll failed:", error));
+  }, 3000);
+  pollFloatingControls().catch(error => console.error("Floating controls poll failed:", error));
+}
+
+function stopFloatingControlsPolling() {
+  if (!floatingControlsTimer) {
+    return;
+  }
+  clearInterval(floatingControlsTimer);
+  floatingControlsTimer = null;
+}
+
+async function openFloatingControls(targetTab) {
+  rememberFloatingControlsTarget(targetTab);
+  const response = await floatingControlsNativeRequest({ action: "open_floating_controls", source: "opera" });
+  if (response && response.ok) {
+    if (response.closed) {
+      floatingControlsFollow = false;
+      await cancelPendingCapture();
+      await syncFloatingControlsStatus(false);
+      setTimeout(() => stopFloatingControlsPolling(), 1500);
+      return response;
+    }
+    startFloatingControlsPolling();
+    return response;
+  }
+
+  return response || { ok: false, error: "Could not open floating controls." };
+}
+
+function openMonitorWindow(targetTab) {
+  const params = new URLSearchParams();
+  if (targetTab && targetTab.id != null) {
+    params.set("tabId", String(targetTab.id));
+  }
+  if (targetTab && targetTab.url) {
+    params.set("pageUrl", targetTab.url);
+  }
+  if (targetTab && targetTab.title) {
+    params.set("pageTitle", targetTab.title);
+  }
+
+  const url = ext.runtime.getURL(`monitor.html?${params.toString()}`);
+  return callbackPromise(done => ext.windows.create({
+    url,
+    type: "popup",
+    width: 380,
+    height: 220
+  }, done)).catch(error => {
+    console.warn("Hook monitor popup window failed, trying normal window.", error);
+    return callbackPromise(done => ext.windows.create({
+      url,
+      type: "normal",
+      width: 380,
+      height: 220
+    }, done));
+  }).catch(error => {
+    console.warn("Hook monitor window failed, opening tab fallback.", error);
+    return callbackPromise(done => ext.tabs.create({ url }, done));
+  });
+}
+
+async function toggleMonitorWindow(targetTab) {
+  if (monitorWindowId != null || monitorTabId != null) {
+    try {
+      if (monitorWindowId != null) {
+        await callbackPromise(done => ext.windows.remove(monitorWindowId, done));
+      } else {
+        await callbackPromise(done => ext.tabs.remove(monitorTabId, done));
+      }
+    } catch (_error) {
+      // The monitor may already be gone; clearing the ids is enough.
+    }
+    monitorWindowId = null;
+    monitorTabId = null;
+    await cancelPendingCapture();
+    return { ok: true, closed: true, disarmed: true };
+  }
+
+  const opened = await openMonitorWindow(targetTab);
+  if (opened && opened.url) {
+    monitorTabId = opened.id;
+    monitorWindowId = null;
+  } else {
+    monitorWindowId = opened && opened.id;
+    monitorTabId = null;
+  }
+  return { ok: true, windowId: monitorWindowId, tabId: monitorTabId };
 }
 
 async function getExternalCaptureDownloads() {
@@ -147,6 +496,14 @@ function urlOrigin(url) {
 }
 
 function isLoversLabUrl(url) {
+  return isSiteUrl(url, "loverslab.com");
+}
+
+function isDwemerModsUrl(url) {
+  return isSiteUrl(url, "dwemermods.com");
+}
+
+function isSiteUrl(url, domain) {
   const host = (() => {
     try {
       return new URL(url).hostname.toLowerCase();
@@ -154,7 +511,11 @@ function isLoversLabUrl(url) {
       return "";
     }
   })();
-  return host === "loverslab.com" || host.endsWith(".loverslab.com");
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+function isSupportedSourceUrl(url) {
+  return isLoversLabUrl(url) || isDwemerModsUrl(url);
 }
 
 async function setPendingLLDownload(eventPayload) {
@@ -315,7 +676,8 @@ async function eventForCompletedArchive(item) {
 function llEventFromCompletedDownload(item) {
   const downloadUrl = item.finalUrl || item.url || "";
   const referrer = item.referrer || "";
-  if (!isLoversLabUrl(downloadUrl) && !isLoversLabUrl(referrer)) {
+  const sourceType = isDwemerModsUrl(downloadUrl) || isDwemerModsUrl(referrer) ? "dwemermods" : "loverslab";
+  if (!isSupportedSourceUrl(downloadUrl) && !isSupportedSourceUrl(referrer)) {
     return null;
   }
 
@@ -327,6 +689,7 @@ function llEventFromCompletedDownload(item) {
   return {
     action: "save_ll_download_event",
     source: "opera",
+    sourceType,
     capturedAt: new Date().toISOString(),
     pageUrl: referrer || downloadUrl,
     download: {
@@ -346,12 +709,6 @@ async function shouldMarkExternalDownload(item) {
     return null;
   }
 
-  const downloadUrl = item.finalUrl || item.url || "";
-  const referrer = item.referrer || "";
-  if (isLoversLabUrl(downloadUrl) || isLoversLabUrl(referrer)) {
-    return null;
-  }
-
   let capturedTab = null;
   try {
     capturedTab = await getTab(capture.tabId);
@@ -360,10 +717,7 @@ async function shouldMarkExternalDownload(item) {
   }
 
   const tabUrl = capturedTab && capturedTab.url ? capturedTab.url : "";
-  if (isLoversLabUrl(tabUrl)) {
-    await storageRemove(["externalArchiveCapture"]);
-    return null;
-  }
+  const referrer = item.referrer || "";
 
   const tabOrigin = urlOrigin(tabUrl);
   if (tabOrigin === capture.pageOrigin) {
@@ -430,6 +784,14 @@ async function handleRuntimeMessage(message) {
     return cancelPendingCapture();
   }
 
+  if (message.action === "popup_open_monitor") {
+    try {
+      return await openFloatingControls(message.targetTab);
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
   if (message.action !== "ll_download_clicked") {
     return { ok: false, error: `Unknown action: ${message.action}` };
   }
@@ -438,7 +800,9 @@ async function handleRuntimeMessage(message) {
     action: "save_ll_download_event",
     source: "opera",
     capturedAt: new Date().toISOString(),
+    sourceType: message.sourceType || "loverslab",
     pageUrl: message.pageUrl,
+    pageTitle: message.pageTitle || "",
     download: message.download
   };
   await setPendingLLDownload(payload);
@@ -518,13 +882,26 @@ ext.downloads.onCreated.addListener(async (item) => {
   await setExternalCaptureDownload(item.id, captureSnapshot);
 });
 
-ext.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!changeInfo.url) {
+ext.tabs.onUpdated.addListener((tabId, changeInfo, tabInfo) => {
+  if (tabInfo && tabInfo.active && isWebTab(tabInfo)) {
+    rememberFloatingControlsTarget(tabInfo);
+  }
+
+  if (!changeInfo.url && !changeInfo.title) {
     return;
   }
 
   getExternalArchiveCapture().then((capture) => {
     if (!capture || capture.tabId !== tabId) {
+      return;
+    }
+
+    if (floatingControlsFollow) {
+      tabById(tabId).then((tab) => {
+        if (tab) {
+          armCaptureForTab(tab).then(() => syncFloatingControlsStatus(true));
+        }
+      });
       return;
     }
 
@@ -535,11 +912,40 @@ ext.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 ext.tabs.onActivated.addListener((activeInfo) => {
-  getExternalArchiveCapture().then((capture) => {
+  tabById(activeInfo.tabId).then((tab) => {
+    if (tab) {
+      rememberFloatingControlsTarget(tab);
+    } else {
+      floatingControlsTargetTab = null;
+    }
+
+    return getExternalArchiveCapture().then((capture) => ({ capture, tab }));
+  }).then(({ capture, tab }) => {
+    if (floatingControlsFollow && capture) {
+      if (tab) {
+        armCaptureForTab(tab).then(() => syncFloatingControlsStatus(true));
+      }
+      return;
+    }
+
     if (!capture || capture.tabId === activeInfo.tabId) {
       return;
     }
 
     shortenExternalCapture("Captured tab is no longer active; capture will stop soon.");
   });
+});
+
+ext.windows.onRemoved.addListener((windowId) => {
+  if (windowId === monitorWindowId) {
+    monitorWindowId = null;
+    cancelPendingCapture();
+  }
+});
+
+ext.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === monitorTabId) {
+    monitorTabId = null;
+    cancelPendingCapture();
+  }
 });

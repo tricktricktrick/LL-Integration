@@ -9,6 +9,7 @@ native-app/run.bat
 native-app/ll_integration_native.exe
 native-app/cookies_storage/
 native-app/downloads_storage/
+native-app/floating_controls/
 native-app/metadata/
 
 # MO2 plugin runtime output

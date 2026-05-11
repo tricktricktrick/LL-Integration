@@ -1,12 +1,13 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
+import time
 import tkinter as tk
 import winreg
 from pathlib import Path
 from tkinter import filedialog, messagebox
-
 
 APP_NAME = "LLIntegration"
 NATIVE_NAME = "ll_integration_native"
@@ -63,7 +64,7 @@ class InstallerApp(tk.Tk):
         self.with_toolbar = installer_with_toolbar()
         self.mode_label = "With Toolbar" if self.with_toolbar else "Stable"
         self.title(f"LL Integration Installer - {self.mode_label}")
-        self.geometry("680x360")
+        self.geometry("680x400")
         self.resizable(False, False)
         self.configure(bg=BG)
         self._icon_image = None
@@ -74,6 +75,7 @@ class InstallerApp(tk.Tk):
         self.downloads_path = tk.StringVar(value=existing_state.get("mo2_downloads_path", ""))
         self.status = tk.StringVar(value="Choose ModOrganizer.exe to begin.")
         self.delete_data = tk.BooleanVar(value=False)
+        self.floating_controls = tk.BooleanVar(value=existing_state.get("floating_controls_enabled", False))
 
         self._build_ui()
         self._validate()
@@ -103,6 +105,18 @@ class InstallerApp(tk.Tk):
         install_text = "Install With Toolbar" if self.with_toolbar else "Install Stable"
         self.install_button = self._button(self, install_text, self._install, accent=True, height=2)
         self.install_button.pack(fill="x", padx=14, pady=12)
+
+        tk.Checkbutton(
+            self,
+            text="Install optional floating capture controls",
+            variable=self.floating_controls,
+            bg=BG,
+            fg=MUTED,
+            activebackground=BG,
+            activeforeground=TEXT,
+            selectcolor=PANEL,
+            highlightthickness=0,
+        ).pack(anchor="w", padx=14, pady=(0, 4))
 
         uninstall_frame = tk.Frame(self, bg=BG)
         uninstall_frame.pack(fill="x", padx=14, pady=2)
@@ -136,6 +150,7 @@ class InstallerApp(tk.Tk):
         note = (
             "This installs the native bridge in %LOCALAPPDATA%, copies the MO2 plugin, "
             "and registers browser Native Messaging for the current Windows user. "
+            "Floating capture controls are optional and only provide Arm / Disarm / Follow buttons. "
             + (
                 "This build enables the experimental MO2 toolbar button."
                 if self.with_toolbar
@@ -236,6 +251,7 @@ class InstallerApp(tk.Tk):
             state["mo2_path"] = mo2_path
         if downloads_path:
             state["mo2_downloads_path"] = downloads_path
+        state["floating_controls_enabled"] = bool(data.get("floating_controls_enabled", False))
         return state
 
     def _validate(self) -> bool:
@@ -294,6 +310,147 @@ class InstallerApp(tk.Tk):
             if candidate.exists():
                 return candidate
         return None
+    def _powershell_literal(self, value: Path | str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _stop_running_native_processes(self) -> None:
+        """
+        Stop LL Integration native/overlay processes without killing the browser.
+
+        This targets only processes whose ExecutablePath or CommandLine points inside
+        %LOCALAPPDATA%\\LLIntegration, so it should not kill random python.exe processes.
+        """
+        exact_names = [
+            "ll_integration_native",
+            "ll_integration_overlay",
+        ]
+        try:
+            subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "Stop-Process -Name ll_integration_native,ll_integration_overlay -Force -ErrorAction SilentlyContinue",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        roots = [
+            INSTALL_ROOT,
+            NATIVE_TARGET,
+        ]
+
+        escaped_names = ",".join(self._powershell_literal(name) for name in exact_names)
+        escaped_roots = ",".join(self._powershell_literal(root) for root in roots)
+        command = rf"""
+$names = @({escaped_names})
+$roots = @({escaped_roots})
+$targets = Get-CimInstance Win32_Process | Where-Object {{
+    $cmd = [string]$_.CommandLine
+    $exe = [string]$_.ExecutablePath
+    if ($names -contains $_.Name.Replace('.exe', '')) {{
+        return $true
+    }}
+    foreach ($root in $roots) {{
+        if ($cmd -like "*$root*" -or $exe -like "*$root*") {{
+            return $true
+        }}
+    }}
+    return $false
+}}
+
+foreach ($p in $targets) {{
+    try {{
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }} catch {{}}
+}}
+"""
+
+        try:
+            subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    def _reset_floating_controls_state(self) -> None:
+        state_dir = NATIVE_TARGET / "floating_controls"
+        state_path = state_dir / "state.json"
+        state = {
+            "seq": 0,
+            "command": "",
+            "follow": False,
+            "armed": False,
+            "visible": False,
+            "pid": "",
+            "label": "Idle",
+        }
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _copy2_retry(self, source: Path, target: Path, attempts: int = 5) -> None:
+        last_error = None
+
+        for attempt in range(attempts):
+            try:
+                shutil.copy2(source, target)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                self._stop_running_native_processes()
+                time.sleep(0.4 + attempt * 0.2)
+
+        if last_error:
+            raise last_error
+
+    def _rmtree_retry(self, target: Path, attempts: int = 5) -> None:
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                shutil.rmtree(target)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                self._stop_running_native_processes()
+                time.sleep(0.4 + attempt * 0.2)
+        if last_error:
+            raise last_error
+
+    def _copytree_retry(self, source: Path, target: Path, attempts: int = 5) -> None:
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                shutil.copytree(source, target, dirs_exist_ok=True)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                self._stop_running_native_processes()
+                time.sleep(0.4 + attempt * 0.2)
+        if last_error:
+            raise last_error
 
     def _install(self) -> None:
         if not self._validate():
@@ -304,8 +461,15 @@ class InstallerApp(tk.Tk):
             downloads_path = Path(self.downloads_path.get().strip())
             mo2_root = mo2_path.parent
 
+            # Prevent the browser extension from keeping the old native host locked
+            # while files are being replaced.
+            self._unregister_native_messaging()
+            self._stop_running_native_processes()
+            self._reset_floating_controls_state()
+
             self._install_native_app(mo2_path, downloads_path)
             self._install_mo2_plugin(mo2_root)
+
             self._register_native_messaging()
 
             messagebox.showinfo(
@@ -344,10 +508,14 @@ class InstallerApp(tk.Tk):
 
         try:
             self._unregister_native_messaging()
+            self._stop_running_native_processes()
+
             if plugin_path.exists():
                 shutil.rmtree(plugin_path)
+
             if delete_data and INSTALL_ROOT.exists():
                 shutil.rmtree(INSTALL_ROOT)
+
 
             messagebox.showinfo("Uninstalled", "LL Integration was uninstalled.")
             self.status.set("Uninstalled.")
@@ -360,14 +528,14 @@ class InstallerApp(tk.Tk):
         native_exe_source = ROOT_DIR / "native-app" / "ll_integration_native.exe"
         if native_exe_source.exists():
             native_exe_target = NATIVE_TARGET / "ll_integration_native.exe"
-            shutil.copy2(native_exe_source, native_exe_target)
+            self._copy2_retry(native_exe_source, native_exe_target)
             native_launch_path = native_exe_target
             stale_run_bat = NATIVE_TARGET / "run.bat"
             if stale_run_bat.exists():
                 stale_run_bat.unlink()
         else:
-            for name in ["main.py"]:
-                shutil.copy2(ROOT_DIR / "native-app" / name, NATIVE_TARGET / name)
+            for name in ["main.py", "overlay.py"]:
+                self._copy2_retry(ROOT_DIR / "native-app" / name, NATIVE_TARGET / name)
 
             python_exe = Path(sys.executable)
             run_bat = f'@echo off\r\n"{python_exe}" "{NATIVE_TARGET / "main.py"}"\r\n'
@@ -380,8 +548,17 @@ class InstallerApp(tk.Tk):
             "metadata_path": str(INSTALL_ROOT / "metadata"),
             "copy_archives_to_mo2_downloads": True,
             "overwrite_existing_downloads": True,
+            "floating_controls_enabled": bool(self.floating_controls.get()),
         }
         (NATIVE_TARGET / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+        overlay_exe_source = ROOT_DIR / "native-app" / "ll_integration_overlay.exe"
+        if overlay_exe_source.exists():
+            self._copy2_retry(overlay_exe_source, NATIVE_TARGET / "ll_integration_overlay.exe")
+        else:
+            overlay_py_source = ROOT_DIR / "native-app" / "overlay.py"
+            if overlay_py_source.exists():
+                self._copy2_retry(overlay_py_source, NATIVE_TARGET / "overlay.py")
 
         firefox_manifest = {
             "name": NATIVE_NAME,
@@ -412,7 +589,7 @@ class InstallerApp(tk.Tk):
         target.mkdir(parents=True, exist_ok=True)
 
         for name in ["__init__.py", "plugin.py", "utils.py", "check_update.py", "LL.sample.ini"]:
-            shutil.copy2(source / name, target / name)
+            self._copy2_retry(source / name, target / name)
 
         icons_source = source / "icons"
         icons_target = target / "icons"
@@ -420,16 +597,16 @@ class InstallerApp(tk.Tk):
             icons_target.mkdir(parents=True, exist_ok=True)
             for icon in icons_source.iterdir():
                 if icon.is_file():
-                    shutil.copy2(icon, icons_target / icon.name)
+                    self._copy2_retry(icon, icons_target / icon.name)
 
         experimental_source = source / "experimental"
         experimental_target = target / "experimental"
         if self.with_toolbar and experimental_source.exists():
             if experimental_target.exists():
-                shutil.rmtree(experimental_target)
-            shutil.copytree(experimental_source, experimental_target)
+                self._rmtree_retry(experimental_target)
+            self._copytree_retry(experimental_source, experimental_target)
         elif experimental_target.exists():
-            shutil.rmtree(experimental_target)
+            self._rmtree_retry(experimental_target)
 
         plugin_paths = {
             "ll_ini_path": str(NATIVE_TARGET / "downloads_storage" / "latest_ll_download.ini"),

@@ -103,6 +103,10 @@ small {
   margin-top: 12px;
 }
 
+.single-action {
+  grid-template-columns: 1fr;
+}
+
 button {
   height: 32px;
   border: 1px solid #3c4a42;
@@ -131,8 +135,14 @@ button:hover {
   background: #513237;
 }
 
+#monitorButton {
+  border-color: #5f6f8f;
+  background: #33415f;
+}
+
 button:disabled {
   opacity: 0.45;
+  cursor: wait;
 }
 
 .message {

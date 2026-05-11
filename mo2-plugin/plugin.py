@@ -5,7 +5,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Sequence
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 from urllib.request import Request, urlopen
 import webbrowser
 
@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QGridLayout,
     QHBoxLayout,
+    QAbstractItemView,
     QInputDialog,
     QLabel,
     QListWidget,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
 )
 
@@ -52,6 +54,7 @@ UPDATE_CACHE_VERSION = 1
 LL_SECTION = "LoversLab"
 MOD_META_FILE = "meta.ini"
 LEGACY_MOD_LL_FILE = "LL.ini"
+
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 UPDATE_MODE_MANUAL = "manual"
 UPDATE_MODE_DOWNLOAD_ONLY = "download_only"
@@ -66,7 +69,96 @@ UPDATE_MODE_OPTIONS = [
     (UPDATE_MODE_SKIP, "Skip updates", True),
 ]
 UPDATE_MODE_LABELS = {value: label for value, label, _enabled in UPDATE_MODE_OPTIONS}
+VOICE_KEYWORDS = (
+    "voice",
+    "voices",
+    "voiced",
+    "dbvo",
+    "dvo",
+    "idtv",
+    "dialogue voice",
+    "dialogue voices",
+    "voice pack",
+    "voice files",
+    "voicefiles",
+    "voice addon",
+    "voice add-on",
+    "silent voice",
+)
 
+VOICE_NOISE_WORDS_RE = re.compile(
+    r"""
+    \b(
+        dbvo
+        | dvo
+        | idtv
+        | voice
+        | voices
+        | voiced
+        | voicepack
+        | voicefiles
+        | voice[\s_-]*files
+        | voice[\s_-]*pack
+        | voice[\s_-]*addon
+        | add[\s_-]*on
+        | addon
+        | dialogue[\s_-]*voice
+        | dialogue[\s_-]*voices
+        | silent[\s_-]*voice
+        | patch
+        | se
+        | ae
+        | le
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+def normalized_voice_name(value: str) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"\.(?:7z|zip|rar|tar|gz|bz2|xz)$", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bv?\d+(?:[._-]\d+){1,4}\b", " ", text, flags=re.IGNORECASE)
+    text = VOICE_NOISE_WORDS_RE.sub(" ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(token for token in text.split() if len(token) > 1)
+
+
+def voice_keyword_present(value: str) -> bool:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    padded = f" {text} "
+    return any(f" {keyword} " in padded for keyword in VOICE_KEYWORDS)
+
+
+def voice_match_score(base_name: str, voice_name: str) -> int:
+    base = normalized_voice_name(base_name)
+    voice = normalized_voice_name(voice_name)
+
+    if not base or not voice:
+        return 0
+
+    score = 0
+
+    if base == voice:
+        score += 120
+    elif base in voice or voice in base:
+        score += 85
+
+    base_tokens = set(base.split())
+    voice_tokens = set(voice.split())
+    common = base_tokens & voice_tokens
+
+    if base_tokens:
+        score += int((len(common) / len(base_tokens)) * 70)
+
+    if voice_keyword_present(voice_name):
+        score += 25
+
+    return min(score, 160)
+
+
+def voice_search_query(base_name: str) -> str:
+    clean = normalized_voice_name(base_name)
+    return f"{clean} voice OR voices OR DBVO OR IDTV".strip()
 
 def normalized_update_mode(value: str | None, fixed: bool = False) -> str:
     mode = str(value or "").strip().lower()
@@ -199,6 +291,66 @@ def write_update_download_sidecar(
     ]
     sidecar = Path(f"{archive_path}.ll.ini")
     sidecar.write_text("\n".join(lines), encoding="utf-8")
+    return sidecar
+
+
+def write_voice_download_sidecar(
+    archive_path: Path,
+    candidate: dict,
+    download_url: str,
+) -> Path:
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    archive_hash = archive_quick_hash(archive_path) if archive_path.exists() else ""
+    archive_size = str(archive_path.stat().st_size) if archive_path.exists() else ""
+    page_url = str(candidate.get("source_url") or candidate.get("page_url") or "").strip()
+    download_name = str(candidate.get("download_name") or archive_path.name).strip()
+    lines = [
+        "[LoversLab]",
+        "source=loverslab",
+        f"ll_file_id={ini_value(ll_file_id_from_url(page_url))}",
+        f"ll_resource_id={ini_value(ll_resource_id(download_url))}",
+        f"page_url={ini_value(page_url)}",
+        f"page_title={ini_value(candidate.get('source_title') or 'Voice pack source')}",
+        f"download_url={ini_value(download_url)}",
+        f"file_name={ini_value(download_name)}",
+        f"original_archive_name={ini_value(download_name)}",
+        f"archive_name={ini_value(archive_path.name)}",
+        f"archive_size_bytes={archive_size}",
+        f"archive_quick_hash={archive_hash}",
+        f"version={ini_value(candidate.get('version') or '')}",
+        f"size={ini_value(candidate.get('size') or '')}",
+        f"date_iso={ini_value(candidate.get('date_iso') or '')}",
+        f"captured_at={now}",
+        f"archive_path={ini_value(archive_path)}",
+        f"browser_download_url={ini_value(download_url)}",
+        f"completed_at={now}",
+        "update_mode=manual",
+        "fixed_version=true",
+        "manual_update=true",
+        "skip_update_check=true",
+        "manual_install=true",
+        "multipart=false",
+        f"file_pattern={ini_value(download_name)}",
+        f"voice_base_mod={ini_value(candidate.get('base_mod') or '')}",
+        f"voice_match_score={ini_value(candidate.get('online_score') or candidate.get('score') or '')}",
+        "",
+    ]
+    sidecar = Path(f"{archive_path}.ll.ini")
+    sidecar.write_text("\n".join(lines), encoding="utf-8")
+    Path(f"{archive_path}.ll.json").write_text(
+        json.dumps(
+            {
+                "sourceType": "loverslab",
+                "voiceCandidate": candidate,
+                "archiveName": archive_path.name,
+                "archivePath": str(archive_path),
+                "browserDownloadUrl": download_url,
+                "completedAt": now,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return sidecar
 
 
@@ -3011,7 +3163,7 @@ class LoversLabMenuTool(LoversLabBaseTool):
     def display(self) -> None:
         dialog = QDialog(self._parentWidget())
         dialog.setWindowTitle("LL Integration")
-        dialog.resize(430, 260)
+        dialog.resize(430, 300)
 
         title = QLabel("LL Integration")
         title.setStyleSheet("font-weight: 700; font-size: 15px;")
@@ -3023,6 +3175,11 @@ class LoversLabMenuTool(LoversLabBaseTool):
                 "Manage LoversLab Links",
                 "Open the mod list, page links, purge buttons, and optional update fetch.",
                 LoversLabCheckAllTool,
+            ),
+            (
+                "Find Voice Packs",
+                "Scan LoversLab mods and detect installed or missing voice packs.",
+                LoversLabVoiceFinderTool,
             ),
             (
                 "Create Manual Link",
@@ -3066,6 +3223,2037 @@ class LoversLabMenuTool(LoversLabBaseTool):
         tool.init(self._organizer)
         tool.display()
 
+
+class VoiceSourceFetchWorker(QObject):
+    candidatesReady = pyqtSignal(object)
+    downloadsReady = pyqtSignal(object)
+    statusChanged = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(
+        self,
+        rows: list[dict],
+        source_urls: list[str],
+        cookies_path: Path,
+        false_matches: list[dict],
+        timeout: float = UPDATE_REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__()
+        self._rows = [dict(row) for row in rows]
+        self._source_urls = list(source_urls)
+        self._cookies_path = cookies_path
+        self._false_matches = list(false_matches)
+        self._timeout = timeout
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            candidates = []
+            all_downloads = []
+            total = len(self._source_urls)
+            for index, source_url in enumerate(self._source_urls, start=1):
+                if self._cancelled:
+                    self.finished.emit(False, "Cancelled")
+                    return
+
+                self.statusChanged.emit(f"Fetching voice source {index} / {total}: {source_url}")
+                html = fetch_ll_html(source_url, self._cookies_path, timeout=self._timeout)
+                downloads = extract_downloads(html)
+                for download in downloads:
+                    download_candidate = {
+                        "source_url": with_query_value(source_url, "do", "download"),
+                        "source_title": "Voice pack source",
+                        "download_name": download.name,
+                        "download_url": download.url,
+                        "size": download.size or "",
+                        "date_iso": download.date_iso or "",
+                        "version": download.version or "",
+                    }
+                    all_downloads.append(dict(download_candidate))
+                    best = self._best_base_match(download_candidate)
+                    if best:
+                        candidates.append(best)
+
+                self.candidatesReady.emit(candidates)
+                self.downloadsReady.emit(all_downloads)
+                time.sleep(UPDATE_REQUEST_DELAY_SECONDS)
+
+            self.candidatesReady.emit(candidates)
+            self.downloadsReady.emit(all_downloads)
+            self.finished.emit(True, f"Fetched {total} voice source page(s).")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
+
+    def _best_base_match(self, candidate: dict) -> dict | None:
+        best = None
+        best_score = 0
+        for row in self._rows:
+            if row.get("status") == "Ignored":
+                continue
+            if self._is_false_match(row, candidate):
+                continue
+
+            score = voice_match_score(row.get("base_mod") or "", candidate.get("download_name") or "")
+            if score > best_score:
+                best_score = score
+                best = row
+
+        if not best or best_score < 55:
+            return None
+
+        result = dict(candidate)
+        result.update({
+            "base_mod": best.get("base_mod") or "",
+            "base_internal_name": best.get("base_internal_name") or "",
+            "base_page_url": best.get("base_page_url") or "",
+            "online_score": best_score,
+        })
+        return result
+
+    def _is_false_match(self, row: dict, candidate: dict) -> bool:
+        base_key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
+        candidate_key = str(candidate.get("download_name") or "").lower()
+        source_url = str(candidate.get("source_url") or "").lower()
+        for item in self._false_matches:
+            if str(item.get("base") or "").lower() != base_key:
+                continue
+            if str(item.get("candidate") or "").lower() != candidate_key:
+                continue
+            if str(item.get("source_url") or "").lower() in ("", source_url):
+                return True
+        return False
+
+
+class VoiceCandidateDownloadWorker(QObject):
+    statusChanged = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, object)
+
+    def __init__(
+        self,
+        candidate: dict,
+        downloads_path: Path,
+        cookies_path: Path,
+        timeout: float = 60.0,
+    ) -> None:
+        super().__init__()
+        self._candidate = dict(candidate)
+        self._downloads_path = downloads_path
+        self._cookies_path = cookies_path
+        self._timeout = timeout
+
+    def run(self) -> None:
+        try:
+            download_url = str(self._candidate.get("download_url") or "")
+            source_url = str(self._candidate.get("source_url") or "")
+            if not download_url:
+                raise RuntimeError("Candidate download URL is missing.")
+            if not self._downloads_path:
+                raise RuntimeError("MO2 downloads path is not available.")
+
+            archive_name = safe_archive_name(self._candidate.get("download_name") or "voice-pack.7z")
+            archive_path = self._downloads_path / archive_name
+            self.statusChanged.emit(f"Downloading voice candidate: {archive_name}")
+            already_exists = archive_path.exists()
+            if not already_exists:
+                download_loverslab_archive(
+                    urljoin(source_url, download_url),
+                    archive_path,
+                    self._cookies_path,
+                    referer=source_url,
+                    timeout=self._timeout,
+                )
+
+            sidecar = write_voice_download_sidecar(
+                archive_path,
+                self._candidate,
+                urljoin(source_url, download_url),
+            )
+            result = {
+                "archive_path": str(archive_path),
+                "sidecar_path": str(sidecar),
+                "already_exists": already_exists,
+            }
+            self.finished.emit(True, "Voice candidate downloaded." if not already_exists else "Voice candidate already existed; metadata refreshed.", result)
+        except Exception as exc:
+            self.finished.emit(False, str(exc), {})
+
+
+class LoversLabVoiceFinderTool(LoversLabBaseTool):
+    TOOL_NAME = "LL Integration Voice Finder"
+    TOOL_DISPLAY = "Find LoversLab Voice Packs"
+    TOOL_DESCRIPTION = "Finds installed or likely missing voice packs for LoversLab mods."
+
+    COL_STATUS = 0
+    COL_BASE_MOD = 1
+    COL_INSTALLED_VOICE = 2
+    COL_SCORE = 3
+    COL_ONLINE = 4
+    COL_ONLINE_SCORE = 5
+    COL_SOURCE = 6
+    COL_PAGE = 7
+
+    def icon(self) -> QIcon:
+        return QIcon(str(Path(__file__).resolve().parent / "icons" / "ll_check_all.svg"))
+
+    def display(self) -> None:
+        try:
+            config = self._load_voice_config()
+            rows = self._collect_voice_rows(config)
+        except Exception as exc:
+            QMessageBox.critical(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                f"Voice scan failed:\n\n{exc}",
+            )
+            return
+
+        self._show_results(rows)
+
+    def _voice_config_path(self) -> Path:
+        if self._organizer:
+            path = Path(str(self._organizer.pluginDataPath())) / "ll_integration"
+            path.mkdir(parents=True, exist_ok=True)
+            return path / "voice_finder.json"
+        return Path(__file__).resolve().parent / "voice_finder.json"
+
+    def _load_voice_config(self) -> dict:
+        path = self._voice_config_path()
+        if not path.exists():
+            return {
+                "version": 1,
+                "voiceSourceUrls": [],
+                "falseMatches": [],
+                "ignoredBaseMods": [],
+                "manualVoiceMatches": {},
+                "forcedVoiceMods": [],
+                "forcedBaseMods": [],
+            }
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        return {
+            "version": 1,
+            "voiceSourceUrls": list(data.get("voiceSourceUrls") or []),
+            "falseMatches": list(data.get("falseMatches") or []),
+            "ignoredBaseMods": list(data.get("ignoredBaseMods") or []),
+            "manualVoiceMatches": dict(data.get("manualVoiceMatches") or {}),
+            "forcedVoiceMods": list(data.get("forcedVoiceMods") or []),
+            "forcedBaseMods": list(data.get("forcedBaseMods") or []),
+        }
+
+    def _save_voice_config(self, config: dict) -> None:
+        path = self._voice_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    def _collect_voice_rows(self, config: dict) -> list[dict]:
+        if not self._organizer:
+            raise RuntimeError("MO2 organizer is not available")
+
+        mod_list = self._organizer.modList()
+        all_mods = []
+        forced_voice_mods = {str(value).lower() for value in config.get("forcedVoiceMods", [])}
+        forced_base_mods = {str(value).lower() for value in config.get("forcedBaseMods", [])}
+
+        for internal_name in mod_list.allModsByProfilePriority():
+            mod = mod_list.getMod(internal_name)
+            if mod is None:
+                continue
+
+            display_name = mod_list.displayName(internal_name)
+            key = str(internal_name).lower()
+            auto_voice = voice_keyword_present(display_name)
+            is_voice = (auto_voice or key in forced_voice_mods) and key not in forced_base_mods
+            all_mods.append({
+                "internal_name": internal_name,
+                "display_name": display_name,
+                "mod": mod,
+                "is_voice": is_voice,
+                "auto_is_voice": auto_voice,
+                "classification_override": "voice" if key in forced_voice_mods else "base" if key in forced_base_mods else "auto",
+                "ll_metadata": mod_ll_metadata_path(mod, migrate_legacy=False),
+            })
+
+        installed_voice_mods = [item for item in all_mods if item["is_voice"]]
+        base_mods = [
+            item
+            for item in all_mods
+            if item["ll_metadata"] is not None and not item["is_voice"]
+        ]
+
+        rows = []
+        for base in base_mods:
+            voice_candidates = self._installed_voice_candidates(base, installed_voice_mods, config)
+            manual_voice = self._manual_voice_candidate(config, base, all_mods)
+            if manual_voice:
+                voice_candidates = [
+                    manual_voice,
+                    *[
+                        candidate
+                        for candidate in voice_candidates
+                        if str(candidate.get("internal_name") or "").lower()
+                        != str(manual_voice.get("internal_name") or "").lower()
+                    ],
+                ]
+            best_voice = next(
+                (
+                    candidate
+                    for candidate in voice_candidates
+                    if candidate.get("manual") or int(candidate.get("score") or 0) > 0
+                ),
+                None,
+            ) or {
+                "display_name": "",
+                "internal_name": "",
+                "score": 0,
+                "mod_path": "",
+                "manual": False,
+            }
+            page_url = self._ll_page_url(base["ll_metadata"])
+            ignored = self._base_key(base) in {str(value).lower() for value in config.get("ignoredBaseMods", [])}
+
+            if ignored:
+                status = "Ignored"
+            elif best_voice.get("manual") or best_voice["score"] >= 90:
+                status = "Installed"
+            elif best_voice["score"] >= 55:
+                status = "Possible"
+            else:
+                status = "Missing"
+
+            rows.append({
+                "status": status,
+                "base_mod": base["display_name"],
+                "base_internal_name": base["internal_name"],
+                "classification_override": base.get("classification_override") or "auto",
+                "base_page_url": page_url,
+                "installed_voice": best_voice["display_name"],
+                "installed_voice_internal_name": best_voice["internal_name"],
+                "score": best_voice["score"],
+                "manual_voice": bool(best_voice.get("manual")),
+                "installed_voice_candidates": voice_candidates,
+                "online_candidate": "",
+                "online_download_url": "",
+                "online_source_url": "",
+                "online_score": 0,
+                "online_size": "",
+                "online_date_iso": "",
+                "online_version": "",
+                "online_candidates": [],
+                "search_query": voice_search_query(base["display_name"]),
+            })
+
+        rows.sort(key=lambda row: (
+            {"Missing": 0, "Online found": 1, "Possible": 2, "Installed": 3, "Ignored": 4}.get(row["status"], 9),
+            row["base_mod"].lower(),
+        ))
+        return rows
+
+    def _base_key(self, base: dict) -> str:
+        return str(base.get("internal_name") or base.get("base_internal_name") or base.get("display_name") or base.get("base_mod") or "").lower()
+
+    def _manual_voice_candidate(self, config: dict, base: dict, all_mods: list[dict]) -> dict | None:
+        matches = config.get("manualVoiceMatches")
+        if not isinstance(matches, dict):
+            return None
+
+        entry = matches.get(self._base_key(base))
+        if not isinstance(entry, dict):
+            return None
+
+        internal_name = str(entry.get("internal_name") or "").lower()
+        if not internal_name:
+            return None
+
+        for mod in all_mods:
+            if str(mod.get("internal_name") or "").lower() != internal_name:
+                continue
+            if str(mod.get("internal_name") or "") == str(base.get("internal_name") or ""):
+                return None
+            return {
+                "display_name": mod.get("display_name") or entry.get("display_name") or "",
+                "internal_name": mod.get("internal_name") or entry.get("internal_name") or "",
+                "mod_path": str(mod_root_path(mod["mod"])),
+                "score": 1000,
+                "manual": True,
+            }
+
+        return {
+            "display_name": entry.get("display_name") or entry.get("internal_name") or "",
+            "internal_name": entry.get("internal_name") or "",
+            "mod_path": entry.get("mod_path") or "",
+            "score": 1000,
+            "manual": True,
+        }
+
+    def _installed_voice_candidates(self, base: dict, voice_mods: list[dict], config: dict) -> list[dict]:
+        candidates = []
+        for voice in voice_mods:
+            if voice["internal_name"] == base["internal_name"]:
+                continue
+            if self._is_false_match(config, base, voice["display_name"], ""):
+                continue
+
+            score = voice_match_score(base["display_name"], voice["display_name"])
+            candidates.append({
+                "display_name": voice["display_name"],
+                "internal_name": voice["internal_name"],
+                "mod_path": str(mod_root_path(voice["mod"])),
+                "score": score,
+            })
+
+        return sorted(
+            candidates,
+            key=lambda item: (-int(item.get("score") or 0), str(item.get("display_name") or "").lower()),
+        )
+
+    def _is_false_match(self, config: dict, base: dict, candidate: str, source_url: str) -> bool:
+        base_key = self._base_key(base)
+        candidate_key = str(candidate or "").lower()
+        source_key = str(source_url or "").lower()
+        for item in config.get("falseMatches", []):
+            if str(item.get("base") or "").lower() != base_key:
+                continue
+            if str(item.get("candidate") or "").lower() != candidate_key:
+                continue
+            if str(item.get("source_url") or "").lower() in ("", source_key):
+                return True
+        return False
+
+    def _ll_page_url(self, ini_path: Path | None) -> str:
+        if ini_path is None:
+            return ""
+
+        try:
+            ll = read_ll_section(ini_path)
+        except Exception:
+            return ""
+
+        return ll.get("page_url", "").strip()
+
+    def _show_results(self, rows: list[dict]) -> None:
+        dialog = QDialog(self._parentWidget())
+        dialog.setWindowTitle("LL Integration - Voice Finder")
+        dialog.resize(1180, 620)
+        dialog.setMinimumSize(980, 480)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels([
+            "Status",
+            "Base LoversLab mod",
+            "Installed voice candidate",
+            "Score",
+            "Online candidate",
+            "Online score",
+            "Source",
+            "LL page",
+        ])
+        table.setRowCount(len(rows))
+        table._ll_voice_rows = rows
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
+
+        for row_index, row in enumerate(rows):
+            self._fill_table_row(table, row_index, row)
+
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_BASE_MOD, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_INSTALLED_VOICE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_SCORE, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_ONLINE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_ONLINE_SCORE, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_SOURCE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_PAGE, QHeaderView.ResizeMode.Stretch)
+
+        filter_mode = QComboBox(dialog)
+        filter_mode.addItems([
+            "All",
+            "Missing",
+            "Online found",
+            "Possible",
+            "Installed",
+            "Ignored",
+        ])
+
+        filter_text = QLineEdit(dialog)
+        filter_text.setPlaceholderText("Search mod / voice / query")
+        filter_text.setClearButtonEnabled(True)
+
+        count_label = QLabel(dialog)
+        selected_label = QLabel("Selected: none")
+        selected_label.setWordWrap(True)
+
+        open_page = QPushButton("Open LL page")
+        source_urls = QPushButton("Voice source URLs")
+        fetch_sources = QPushButton("Fetch sources")
+        download_candidate = QPushButton("Choose / Download")
+        all_downloads = QPushButton("All downloads")
+        false_match = QPushButton("False local match")
+        manage_false_matches = QPushButton("False matches")
+        ignore_mod = QPushButton("Ignore / Unignore")
+        classify_mod = QPushButton("Classify")
+        voice_mods = QPushButton("Voice mods")
+        search_web = QPushButton("Web search")
+        close = QPushButton("Close")
+        progress_label = QLabel("Ready")
+
+        table.itemSelectionChanged.connect(lambda: self._update_selected_label(table, selected_label))
+        table.itemDoubleClicked.connect(lambda item: self._inspect_double_clicked_cell(table, item))
+        filter_mode.currentTextChanged.connect(
+            lambda _text: self._apply_filter(table, filter_mode, filter_text, count_label)
+        )
+        filter_text.textChanged.connect(
+            lambda _text: self._apply_filter(table, filter_mode, filter_text, count_label)
+        )
+        open_page.clicked.connect(lambda _checked=False: self._open_selected_page(table))
+        source_urls.clicked.connect(lambda _checked=False: self._edit_source_urls(dialog))
+        fetch_sources.clicked.connect(
+            lambda _checked=False: self._fetch_sources(
+                dialog,
+                table,
+                progress_label,
+                fetch_sources,
+                source_urls,
+                download_candidate,
+            )
+        )
+        download_candidate.clicked.connect(
+            lambda _checked=False: self._download_selected_candidate(
+                dialog,
+                table,
+                progress_label,
+                download_candidate,
+                fetch_sources,
+            )
+        )
+        all_downloads.clicked.connect(lambda _checked=False: self._show_all_fetched_downloads(dialog, table, progress_label, download_candidate, fetch_sources))
+        false_match.clicked.connect(lambda _checked=False: self._mark_false_match(table, filter_mode, filter_text, count_label))
+        manage_false_matches.clicked.connect(lambda _checked=False: self._manage_false_matches(table, filter_mode, filter_text, count_label))
+        ignore_mod.clicked.connect(lambda _checked=False: self._toggle_ignore(table, filter_mode, filter_text, count_label))
+        classify_mod.clicked.connect(lambda _checked=False: self._classify_selected_mod(table, filter_mode, filter_text, count_label))
+        voice_mods.clicked.connect(lambda _checked=False: self._show_voice_mods_inventory(dialog))
+        search_web.clicked.connect(lambda _checked=False: self._search_selected_voice(table))
+        close.clicked.connect(dialog.accept)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Filter"))
+        controls.addWidget(filter_mode)
+        controls.addWidget(filter_text, 1)
+        controls.addWidget(count_label)
+
+        source_buttons = QHBoxLayout()
+        source_buttons.addWidget(source_urls)
+        source_buttons.addWidget(fetch_sources)
+        source_buttons.addStretch(1)
+
+        row_buttons = QHBoxLayout()
+        row_buttons.addWidget(download_candidate)
+        row_buttons.addWidget(all_downloads)
+        row_buttons.addWidget(open_page)
+        row_buttons.addWidget(search_web)
+        row_buttons.addWidget(false_match)
+        row_buttons.addWidget(manage_false_matches)
+        row_buttons.addWidget(ignore_mod)
+        row_buttons.addWidget(classify_mod)
+        row_buttons.addWidget(voice_mods)
+        row_buttons.addStretch(1)
+        row_buttons.addWidget(close)
+
+        summary = QLabel(self._summary_text(rows))
+        summary.setWordWrap(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(summary)
+        layout.addLayout(controls)
+        layout.addWidget(selected_label)
+        layout.addWidget(table)
+        layout.addWidget(progress_label)
+        layout.addLayout(source_buttons)
+        layout.addLayout(row_buttons)
+        dialog.setLayout(layout)
+
+        self._apply_filter(table, filter_mode, filter_text, count_label)
+        dialog.exec()
+
+    def _fill_table_row(self, table: QTableWidget, row_index: int, row: dict) -> None:
+        self._set_item(table, row_index, self.COL_STATUS, row.get("status", ""))
+        self._set_item(table, row_index, self.COL_BASE_MOD, row.get("base_mod", ""))
+        self._set_item(table, row_index, self.COL_INSTALLED_VOICE, row.get("installed_voice", ""))
+        self._set_item(table, row_index, self.COL_SCORE, "Manual" if row.get("manual_voice") else str(row.get("score") or ""))
+        self._set_item(table, row_index, self.COL_ONLINE, row.get("online_candidate", ""))
+        self._set_item(table, row_index, self.COL_ONLINE_SCORE, str(row.get("online_score") or ""))
+        self._set_item(table, row_index, self.COL_SOURCE, row.get("online_source_url", ""))
+        self._set_item(table, row_index, self.COL_PAGE, row.get("base_page_url", ""))
+        self._apply_voice_row_background(table, row_index, row)
+
+    def _update_selected_label(self, table: QTableWidget, label: QLabel) -> None:
+        row = self._selected_row(table)
+        if not row:
+            label.setText("Selected: none")
+            return
+
+        candidate = row.get("online_candidate") or row.get("installed_voice") or "no candidate"
+        label.setText(
+            f"Selected: {row.get('base_mod') or ''} | "
+            f"{row.get('status') or ''} | {candidate}"
+        )
+
+    def _set_item(self, table: QTableWidget, row: int, column: int, value: str) -> None:
+        item = QTableWidgetItem(str(value or ""))
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+        if column == self.COL_STATUS:
+            status = str(value or "")
+            if status == "Missing":
+                item.setToolTip("No installed voice-like mod matched this LL mod.")
+            elif status == "Possible":
+                item.setToolTip("A possible voice pack was found, but the score is not high enough to trust automatically.")
+            elif status == "Installed":
+                item.setToolTip("A likely installed voice pack was found.")
+        elif column == self.COL_INSTALLED_VOICE:
+            item.setToolTip("Double-click to inspect all installed voice candidates.")
+        elif column == self.COL_ONLINE:
+            item.setToolTip("Use Choose / Download to inspect all online candidates.")
+
+        table.setItem(row, column, item)
+
+    def _apply_voice_row_background(self, table: QTableWidget, row_index: int, row: dict) -> None:
+        color = self._voice_row_background_color(row)
+        for column in range(table.columnCount()):
+            item = table.item(row_index, column)
+            if item is None:
+                continue
+            item.setBackground(color)
+            item.setForeground(QColor(242, 242, 242))
+
+    def _voice_row_background_color(self, row: dict) -> QColor:
+        status = str(row.get("status") or "")
+        score = int(row.get("score") or 0)
+        online_score = int(row.get("online_score") or 0)
+
+        if row.get("manual_voice"):
+            return QColor(34, 88, 62)
+        if status == "Installed" or score >= 90:
+            return QColor(34, 78, 52)
+        if status == "Possible" or score >= 55:
+            return QColor(88, 70, 30)
+        if status == "Online found":
+            if online_score >= 90:
+                return QColor(34, 78, 52)
+            if online_score >= 55:
+                return QColor(88, 70, 30)
+            return QColor(34, 58, 86)
+        if status == "Missing":
+            return QColor(78, 42, 42)
+        if status == "Ignored":
+            return QColor(54, 54, 54)
+        return QColor(38, 42, 46)
+
+    def _candidate_background_color(self, score: int, manual: bool = False) -> QColor:
+        if manual:
+            return QColor(34, 88, 62)
+        if score >= 90:
+            return QColor(34, 78, 52)
+        if score >= 70:
+            return QColor(64, 82, 42)
+        if score >= 55:
+            return QColor(88, 70, 30)
+        if score > 0:
+            return QColor(76, 48, 40)
+        return QColor(45, 45, 45)
+
+    def _inspect_double_clicked_cell(self, table: QTableWidget, item: QTableWidgetItem) -> None:
+        self._show_installed_voice_candidates(table)
+
+    def _summary_text(self, rows: list[dict]) -> str:
+        total = len(rows)
+        missing = sum(1 for row in rows if row["status"] == "Missing")
+        online = sum(1 for row in rows if row["status"] == "Online found")
+        possible = sum(1 for row in rows if row["status"] == "Possible")
+        installed = sum(1 for row in rows if row["status"] == "Installed")
+        ignored = sum(1 for row in rows if row["status"] == "Ignored")
+
+        return (
+            f"Scanned {total} LoversLab base mods. "
+            f"Missing: {missing}. Online found: {online}. Possible: {possible}. "
+            f"Installed: {installed}. Ignored: {ignored}. "
+            "Add voice source URLs, fetch them, then download selected candidates into MO2 downloads."
+        )
+
+    def _apply_filter(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        mode = filter_mode.currentText()
+        needle = filter_text.text().strip().lower()
+        visible = 0
+
+        for row_index, row in enumerate(getattr(table, "_ll_voice_rows", [])):
+            show = True
+
+            if mode != "All" and row["status"] != mode:
+                show = False
+
+            if needle:
+                haystack = " ".join([
+                    row.get("status", ""),
+                    row.get("base_mod", ""),
+                    row.get("installed_voice", ""),
+                    row.get("online_candidate", ""),
+                    row.get("online_source_url", ""),
+                    row.get("search_query", ""),
+                    row.get("base_page_url", ""),
+                ]).lower()
+                if needle not in haystack:
+                    show = False
+
+            table.setRowHidden(row_index, not show)
+            if show:
+                visible += 1
+
+        count_label.setText(f"{visible} / {table.rowCount()}")
+
+    def _selected_row(self, table: QTableWidget) -> dict | None:
+        selected = table.selectedItems()
+        if not selected:
+            return None
+
+        row_index = selected[0].row()
+        rows = getattr(table, "_ll_voice_rows", [])
+        if row_index < 0 or row_index >= len(rows):
+            return None
+
+        return rows[row_index]
+
+    def _open_selected_page(self, table: QTableWidget) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        url = row.get("base_page_url") or ""
+        if not url:
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "This row has no LoversLab page URL.",
+            )
+            return
+
+        if "loverslab.com/files/file/" in url.lower():
+            url = with_query_value(url, "do", "download")
+        webbrowser.open(url)
+
+    def _show_installed_voice_candidates(self, table: QTableWidget) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        candidates = list(row.get("installed_voice_candidates") or [])
+        candidates = sorted(
+            candidates,
+            key=lambda item: (-int(item.get("score") or 0), str(item.get("display_name") or "").lower()),
+        )
+        if not candidates:
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "No installed voice candidates were found for this mod.",
+            )
+            return
+
+        dialog = QDialog(table.window())
+        dialog.setWindowTitle(f"Installed voice candidates - {row.get('base_mod') or ''}")
+        dialog.resize(900, 500)
+
+        candidate_table = QTableWidget(dialog)
+        candidate_table.setColumnCount(3)
+        candidate_table.setHorizontalHeaderLabels(["Score", "Installed voice candidate", "Folder"])
+        candidate_table.setRowCount(len(candidates))
+        candidate_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        candidate_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        candidate_table.setAlternatingRowColors(True)
+        candidate_table._ll_installed_voice_candidates = candidates
+
+        for index, candidate in enumerate(candidates):
+            for column, value in enumerate([
+                "Manual" if candidate.get("manual") else str(candidate.get("score") or ""),
+                candidate.get("display_name") or "",
+                candidate.get("mod_path") or "",
+            ]):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(str(value or ""))
+                item.setBackground(self._candidate_background_color(
+                    int(candidate.get("score") or 0),
+                    bool(candidate.get("manual")),
+                ))
+                item.setForeground(QColor(242, 242, 242))
+                candidate_table.setItem(index, column, item)
+
+        header = candidate_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        candidate_table.selectRow(0)
+
+        title = QLabel(f"Base mod: {row.get('base_mod') or ''}")
+        title.setStyleSheet("font-weight: 700;")
+        hint = QLabel("Installed candidates are sorted by score. Open a folder to inspect archive contents, or fix the selected candidate as the manual match for this base mod.")
+        hint.setWordWrap(True)
+
+        filter_text = QLineEdit(dialog)
+        filter_text.setPlaceholderText("Filter candidate name or folder")
+        filter_text.setClearButtonEnabled(True)
+        filter_count = QLabel(dialog)
+        filter_text.textChanged.connect(
+            lambda _text: self._apply_installed_candidate_filter(candidate_table, filter_text, filter_count)
+        )
+
+        open_folder = QPushButton("Open selected folder")
+        open_folder.clicked.connect(lambda _checked=False: self._open_selected_voice_folder(candidate_table))
+        candidate_table.itemDoubleClicked.connect(lambda _item: self._open_selected_voice_folder(candidate_table))
+
+        fix_manual = QPushButton("Fix manual selected")
+        fix_manual.clicked.connect(
+            lambda _checked=False: self._fix_manual_voice_candidate(
+                dialog,
+                table,
+                candidate_table,
+                row,
+            )
+        )
+
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(dialog.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(open_folder)
+        buttons.addWidget(fix_manual)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter"))
+        filter_row.addWidget(filter_text, 1)
+        filter_row.addWidget(filter_count)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addLayout(filter_row)
+        layout.addWidget(candidate_table)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+        self._apply_installed_candidate_filter(candidate_table, filter_text, filter_count)
+        dialog.exec()
+
+    def _apply_installed_candidate_filter(
+        self,
+        table: QTableWidget,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        needle = filter_text.text().strip().lower()
+        candidates = getattr(table, "_ll_installed_voice_candidates", [])
+        visible = 0
+        first_visible = -1
+
+        for row_index, candidate in enumerate(candidates):
+            haystack = " ".join([
+                str(candidate.get("score") or ""),
+                "manual" if candidate.get("manual") else "",
+                candidate.get("display_name") or "",
+                candidate.get("internal_name") or "",
+                candidate.get("mod_path") or "",
+            ]).lower()
+            show = not needle or needle in haystack
+            table.setRowHidden(row_index, not show)
+            if show:
+                visible += 1
+                if first_visible < 0:
+                    first_visible = row_index
+
+        count_label.setText(f"{visible} / {len(candidates)}")
+        selected = table.selectedItems()
+        if first_visible >= 0 and (not selected or table.isRowHidden(selected[0].row())):
+            table.selectRow(first_visible)
+
+    def _fix_manual_voice_candidate(
+        self,
+        dialog: QDialog,
+        main_table: QTableWidget,
+        candidate_table: QTableWidget,
+        row: dict,
+    ) -> None:
+        selected = candidate_table.selectedItems()
+        if not selected:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a voice candidate first.")
+            return
+
+        candidates = getattr(candidate_table, "_ll_installed_voice_candidates", [])
+        candidate_index = selected[0].row()
+        if candidate_index < 0 or candidate_index >= len(candidates):
+            return
+
+        candidate = dict(candidates[candidate_index])
+        base_key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
+        if not base_key or not candidate.get("internal_name"):
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "This candidate cannot be bound manually.")
+            return
+
+        config = self._load_voice_config()
+        manual_matches = dict(config.get("manualVoiceMatches") or {})
+        manual_matches[base_key] = {
+            "internal_name": candidate.get("internal_name") or "",
+            "display_name": candidate.get("display_name") or "",
+            "mod_path": candidate.get("mod_path") or "",
+        }
+        config["manualVoiceMatches"] = manual_matches
+        self._save_voice_config(config)
+
+        candidate["score"] = 1000
+        candidate["manual"] = True
+        row["installed_voice"] = candidate.get("display_name") or ""
+        row["installed_voice_internal_name"] = candidate.get("internal_name") or ""
+        row["score"] = 1000
+        row["manual_voice"] = True
+        row["status"] = "Installed"
+        row["installed_voice_candidates"] = [
+            candidate,
+            *[
+                item
+                for item in row.get("installed_voice_candidates", [])
+                if str(item.get("internal_name") or "").lower()
+                != str(candidate.get("internal_name") or "").lower()
+            ],
+        ]
+
+        self._fill_table_row(main_table, self._selected_table_index(main_table), row)
+        QMessageBox.information(
+            dialog,
+            PLUGIN_NAME,
+            f"Manual voice match saved:\n\n{row.get('base_mod') or ''}\n-> {candidate.get('display_name') or ''}",
+        )
+
+    def _open_selected_voice_folder(self, table: QTableWidget) -> None:
+        selected = table.selectedItems()
+        if not selected:
+            return
+        candidates = getattr(table, "_ll_installed_voice_candidates", [])
+        row_index = selected[0].row()
+        if row_index < 0 or row_index >= len(candidates):
+            return
+        path = Path(str(candidates[row_index].get("mod_path") or ""))
+        if not path.exists():
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, f"Folder not found:\n{path}")
+            return
+        self._open_path(path)
+
+    def _open_path(self, path: Path) -> None:
+        target = path if path.is_dir() else path.parent
+        try:
+            webbrowser.open(target.as_uri())
+        except ValueError:
+            webbrowser.open(str(target))
+
+    def _edit_source_urls(self, parent: QDialog) -> None:
+        config = self._load_voice_config()
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Voice Source URLs")
+        dialog.resize(780, 420)
+
+        text = QTextEdit(dialog)
+        text.setPlainText("\n".join(config.get("voiceSourceUrls", [])))
+        text.setPlaceholderText("One LoversLab file URL per line")
+
+        help_text = QLabel(
+            "Add LoversLab pages that contain DBVO/voice downloads. "
+            "The fetch step reads each page's downloads and matches individual archives against missing base mods."
+        )
+        help_text.setWordWrap(True)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(help_text)
+        layout.addWidget(text)
+        layout.addWidget(buttons)
+        dialog.setLayout(layout)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        urls = []
+        for line in text.toPlainText().splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            if "loverslab.com/files/file/" in value.lower():
+                value = with_query_value(value, "do", "download")
+            if value not in urls:
+                urls.append(value)
+        config["voiceSourceUrls"] = urls
+        self._save_voice_config(config)
+        text.setPlainText("\n".join(urls))
+
+    def _fetch_sources(
+        self,
+        dialog: QDialog,
+        table: QTableWidget,
+        progress_label: QLabel,
+        fetch_button: QPushButton,
+        sources_button: QPushButton,
+        download_button: QPushButton,
+    ) -> None:
+        config = self._load_voice_config()
+        urls = [str(url).strip() for url in config.get("voiceSourceUrls", []) if str(url).strip()]
+        if not urls:
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "Add at least one voice source URL first.",
+            )
+            return
+
+        cookies_path = self._setting_path("cookies_path", DEFAULT_COOKIES)
+        rows = getattr(table, "_ll_voice_rows", [])
+        thread = QThread(dialog)
+        worker = VoiceSourceFetchWorker(
+            rows,
+            urls,
+            cookies_path,
+            config.get("falseMatches", []),
+            timeout=UPDATE_REQUEST_TIMEOUT_SECONDS,
+        )
+        worker.moveToThread(thread)
+
+        fetch_button.setEnabled(False)
+        sources_button.setEnabled(False)
+        download_button.setEnabled(False)
+        progress_label.setText("Fetching voice sources...")
+
+        worker.statusChanged.connect(progress_label.setText)
+        worker.candidatesReady.connect(lambda candidates: self._apply_online_candidates(table, list(candidates)))
+        worker.downloadsReady.connect(lambda downloads: setattr(table, "_ll_voice_all_downloads", list(downloads)))
+        worker.finished.connect(
+            lambda ok, message: self._fetch_sources_finished(
+                dialog,
+                thread,
+                worker,
+                progress_label,
+                fetch_button,
+                sources_button,
+                download_button,
+                ok,
+                message,
+            )
+        )
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _fetch_sources_finished(
+        self,
+        dialog: QDialog,
+        thread: QThread,
+        worker: VoiceSourceFetchWorker,
+        progress_label: QLabel,
+        fetch_button: QPushButton,
+        sources_button: QPushButton,
+        download_button: QPushButton,
+        ok: bool,
+        message: str,
+    ) -> None:
+        progress_label.setText(message)
+        fetch_button.setEnabled(True)
+        sources_button.setEnabled(True)
+        download_button.setEnabled(True)
+        thread.quit()
+        thread.wait()
+        worker.deleteLater()
+        thread.deleteLater()
+        if not ok and message != "Cancelled":
+            QMessageBox.warning(dialog, PLUGIN_NAME, f"Voice source fetch failed:\n\n{message}")
+
+    def _apply_online_candidates(self, table: QTableWidget, candidates: list[dict]) -> None:
+        rows = getattr(table, "_ll_voice_rows", [])
+        candidates_by_base = {}
+        for candidate in candidates:
+            base = candidate.get("base_internal_name") or candidate.get("base_mod") or ""
+            candidates_by_base.setdefault(base, []).append(candidate)
+
+        for row_index, row in enumerate(rows):
+            row_candidates = candidates_by_base.get(row.get("base_internal_name") or row.get("base_mod") or "")
+            if not row_candidates:
+                continue
+
+            row_candidates = sorted(
+                row_candidates,
+                key=lambda item: int(item.get("online_score") or 0),
+                reverse=True,
+            )
+            candidate = row_candidates[0]
+            row.update({
+                "online_candidate": candidate.get("download_name") or "",
+                "online_download_url": candidate.get("download_url") or "",
+                "online_source_url": candidate.get("source_url") or "",
+                "online_score": candidate.get("online_score") or 0,
+                "online_size": candidate.get("size") or "",
+                "online_date_iso": candidate.get("date_iso") or "",
+                "online_version": candidate.get("version") or "",
+                "online_candidates": row_candidates,
+            })
+            if row.get("status") == "Missing":
+                row["status"] = "Online found"
+            self._fill_table_row(table, row_index, row)
+
+    def _download_selected_candidate(
+        self,
+        dialog: QDialog,
+        table: QTableWidget,
+        progress_label: QLabel,
+        download_button: QPushButton,
+        fetch_button: QPushButton,
+    ) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        downloads_path = self._mo2_downloads_path()
+        if not downloads_path:
+            QMessageBox.warning(self._parentWidget(), PLUGIN_NAME, "MO2 downloads path is not available.")
+            return
+
+        self._show_online_candidate_download_dialog(
+            dialog,
+            row,
+            downloads_path,
+            progress_label,
+            download_button,
+            fetch_button,
+        )
+
+    def _candidate_from_online_table(self, table: QTableWidget) -> dict | None:
+        selected = table.selectedItems()
+        if not selected:
+            return None
+
+        candidates = getattr(table, "_ll_voice_candidates", [])
+        index = selected[0].row()
+        if index < 0 or index >= len(candidates):
+            return None
+        return dict(candidates[index])
+
+    def _show_online_candidate_download_dialog(
+        self,
+        parent: QDialog,
+        row: dict,
+        downloads_path: Path,
+        main_progress_label: QLabel,
+        main_download_button: QPushButton,
+        main_fetch_button: QPushButton,
+    ) -> None:
+        candidates = list(row.get("online_candidates") or [])
+        if not candidates and row.get("online_download_url"):
+            candidates = [{
+                "download_name": row.get("online_candidate") or "",
+                "download_url": row.get("online_download_url") or "",
+                "source_url": row.get("online_source_url") or "",
+                "online_score": row.get("online_score") or 0,
+                "size": row.get("online_size") or "",
+                "date_iso": row.get("online_date_iso") or "",
+                "version": row.get("online_version") or "",
+            }]
+
+        candidates = sorted(
+            candidates,
+            key=lambda item: int(item.get("online_score") or 0),
+            reverse=True,
+        )
+        if not candidates:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Selected row has no online candidate yet.")
+            return
+
+        dialog = QDialog(parent)
+        dialog.setWindowTitle(f"Download voice candidate - {row.get('base_mod') or ''}")
+        dialog.resize(920, 500)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Score", "Candidate", "Size", "Date", "Source"])
+        table.setRowCount(len(candidates))
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table._ll_voice_candidates = candidates
+
+        for index, candidate in enumerate(candidates):
+            score = int(candidate.get("online_score") or 0)
+            for column, value in enumerate([
+                str(score or ""),
+                candidate.get("download_name") or "",
+                candidate.get("size") or "",
+                candidate.get("date_iso") or "",
+                candidate.get("source_url") or "",
+            ]):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(str(value or ""))
+                item.setBackground(self._candidate_background_color(score))
+                item.setForeground(QColor(242, 242, 242))
+                table.setItem(index, column, item)
+
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        table.selectRow(0)
+
+        title = QLabel(f"Base mod: {row.get('base_mod') or ''}")
+        title.setStyleSheet("font-weight: 700;")
+        hint = QLabel("Select a candidate, then download. This window stays open and shows the download status.")
+        hint.setWordWrap(True)
+        status_label = QLabel("Ready")
+        status_label.setWordWrap(True)
+
+        download_selected = QPushButton("Download selected")
+        hide_online = QPushButton("Hide online match")
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.reject)
+
+        def start_download() -> None:
+            candidate = self._candidate_from_online_table(table)
+            if not candidate:
+                QMessageBox.information(dialog, PLUGIN_NAME, "Select a candidate first.")
+                return
+            self._start_online_candidate_download(
+                dialog,
+                row,
+                candidate,
+                downloads_path,
+                status_label,
+                main_progress_label,
+                download_selected,
+                close,
+                main_download_button,
+                main_fetch_button,
+            )
+
+        download_selected.clicked.connect(lambda _checked=False: start_download())
+        hide_online.clicked.connect(lambda _checked=False: self._hide_selected_online_match(dialog, table, row))
+        table.itemDoubleClicked.connect(lambda _item: start_download())
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(download_selected)
+        buttons.addWidget(hide_online)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addWidget(table)
+        layout.addWidget(status_label)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def _show_all_fetched_downloads(
+        self,
+        parent: QDialog,
+        main_table: QTableWidget,
+        main_progress_label: QLabel,
+        main_download_button: QPushButton,
+        main_fetch_button: QPushButton,
+    ) -> None:
+        row = self._selected_row(main_table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select the target base mod first.")
+            return
+
+        downloads = list(getattr(main_table, "_ll_voice_all_downloads", []) or [])
+        if not downloads:
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "No fetched downloads are available yet.\n\nUse Fetch sources first.",
+            )
+            return
+
+        dialog = QDialog(parent)
+        dialog.setWindowTitle(f"All fetched voice downloads - {row.get('base_mod') or ''}")
+        dialog.resize(980, 540)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Score", "Download", "Size", "Date", "Source"])
+        table.setRowCount(len(downloads))
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table._ll_voice_candidates = downloads
+
+        for index, download in enumerate(downloads):
+            score = voice_match_score(row.get("base_mod") or "", download.get("download_name") or "")
+            download["online_score"] = score
+            for column, value in enumerate([
+                str(score or ""),
+                download.get("download_name") or "",
+                download.get("size") or "",
+                download.get("date_iso") or "",
+                download.get("source_url") or "",
+            ]):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(str(value or ""))
+                item.setBackground(self._candidate_background_color(score))
+                item.setForeground(QColor(242, 242, 242))
+                table.setItem(index, column, item)
+
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        table.selectRow(0)
+
+        filter_text = QLineEdit(dialog)
+        filter_text.setPlaceholderText("Filter download name / source / date")
+        filter_text.setClearButtonEnabled(True)
+        count_label = QLabel(dialog)
+        status_label = QLabel("Ready")
+        status_label.setWordWrap(True)
+
+        def apply_filter() -> None:
+            needle = filter_text.text().strip().lower()
+            visible = 0
+            first_visible = -1
+            for row_index, download in enumerate(downloads):
+                haystack = " ".join([
+                    str(download.get("online_score") or ""),
+                    download.get("download_name") or "",
+                    download.get("size") or "",
+                    download.get("date_iso") or "",
+                    download.get("source_url") or "",
+                ]).lower()
+                show = not needle or needle in haystack
+                table.setRowHidden(row_index, not show)
+                if show:
+                    visible += 1
+                    if first_visible < 0:
+                        first_visible = row_index
+            count_label.setText(f"{visible} / {len(downloads)}")
+            selected = table.selectedItems()
+            if first_visible >= 0 and (not selected or table.isRowHidden(selected[0].row())):
+                table.selectRow(first_visible)
+
+        filter_text.textChanged.connect(lambda _text: apply_filter())
+
+        title = QLabel(f"Target base mod: {row.get('base_mod') or ''}")
+        title.setStyleSheet("font-weight: 700;")
+        hint = QLabel("This list contains every download found in your voice source URLs, even low/no-score files. Pick one manually for the selected base mod.")
+        hint.setWordWrap(True)
+        download_selected = QPushButton("Download selected for this mod")
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.reject)
+
+        def start_download() -> None:
+            candidate = self._candidate_from_online_table(table)
+            if not candidate:
+                QMessageBox.information(dialog, PLUGIN_NAME, "Select a download first.")
+                return
+            downloads_path = self._mo2_downloads_path()
+            if not downloads_path:
+                QMessageBox.warning(dialog, PLUGIN_NAME, "MO2 downloads path is not available.")
+                return
+            self._start_online_candidate_download(
+                dialog,
+                row,
+                candidate,
+                downloads_path,
+                status_label,
+                main_progress_label,
+                download_selected,
+                close,
+                main_download_button,
+                main_fetch_button,
+            )
+
+        download_selected.clicked.connect(lambda _checked=False: start_download())
+        table.itemDoubleClicked.connect(lambda _item: start_download())
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter"))
+        filter_row.addWidget(filter_text, 1)
+        filter_row.addWidget(count_label)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(download_selected)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addLayout(filter_row)
+        layout.addWidget(table)
+        layout.addWidget(status_label)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+        apply_filter()
+        dialog.exec()
+
+    def _hide_selected_online_match(self, dialog: QDialog, table: QTableWidget, row: dict) -> None:
+        candidate = self._candidate_from_online_table(table)
+        if not candidate:
+            QMessageBox.information(dialog, PLUGIN_NAME, "Select an online candidate first.")
+            return
+
+        item = {
+            "base": str(row.get("base_internal_name") or row.get("base_mod") or "").lower(),
+            "candidate": str(candidate.get("download_name") or "").lower(),
+            "source_url": str(candidate.get("source_url") or "").lower(),
+        }
+        if not item["base"] or not item["candidate"]:
+            QMessageBox.information(dialog, PLUGIN_NAME, "This online candidate cannot be hidden.")
+            return
+
+        confirm = QMessageBox.question(
+            dialog,
+            PLUGIN_NAME,
+            "Hide this online candidate from future source fetches?\n\n"
+            f"Base: {row.get('base_mod') or ''}\n"
+            f"Candidate: {candidate.get('download_name') or ''}\n\n"
+            "You can restore it later with the False matches button.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        config = self._load_voice_config()
+        if item not in config["falseMatches"]:
+            config["falseMatches"].append(item)
+        self._save_voice_config(config)
+
+        candidates = getattr(table, "_ll_voice_candidates", [])
+        index = table.selectedItems()[0].row() if table.selectedItems() else -1
+        if 0 <= index < len(candidates):
+            candidates.pop(index)
+            table.removeRow(index)
+            if candidates:
+                table.selectRow(min(index, len(candidates) - 1))
+        row["online_candidates"] = candidates
+        QMessageBox.information(dialog, PLUGIN_NAME, "Online false match saved.")
+
+    def _start_online_candidate_download(
+        self,
+        dialog: QDialog,
+        row: dict,
+        candidate: dict,
+        downloads_path: Path,
+        status_label: QLabel,
+        main_progress_label: QLabel,
+        download_button: QPushButton,
+        close_button: QPushButton,
+        main_download_button: QPushButton,
+        main_fetch_button: QPushButton,
+    ) -> None:
+        candidate = {
+            "base_mod": row.get("base_mod") or "",
+            "base_internal_name": row.get("base_internal_name") or "",
+            "base_page_url": row.get("base_page_url") or "",
+            **candidate,
+        }
+
+        thread = QThread(dialog)
+        worker = VoiceCandidateDownloadWorker(
+            candidate,
+            downloads_path,
+            self._setting_path("cookies_path", DEFAULT_COOKIES),
+        )
+        worker.moveToThread(thread)
+        download_button.setEnabled(False)
+        close_button.setEnabled(False)
+        main_download_button.setEnabled(False)
+        main_fetch_button.setEnabled(False)
+        status_label.setText("Starting download...")
+        main_progress_label.setText("Starting voice candidate download...")
+        worker.statusChanged.connect(status_label.setText)
+        worker.statusChanged.connect(main_progress_label.setText)
+        worker.finished.connect(
+            lambda ok, message, result: self._online_candidate_download_finished(
+                dialog,
+                thread,
+                worker,
+                status_label,
+                main_progress_label,
+                download_button,
+                close_button,
+                main_download_button,
+                main_fetch_button,
+                ok,
+                message,
+                dict(result or {}),
+            )
+        )
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _online_candidate_download_finished(
+        self,
+        dialog: QDialog,
+        thread: QThread,
+        worker: VoiceCandidateDownloadWorker,
+        status_label: QLabel,
+        main_progress_label: QLabel,
+        download_button: QPushButton,
+        close_button: QPushButton,
+        main_download_button: QPushButton,
+        main_fetch_button: QPushButton,
+        ok: bool,
+        message: str,
+        result: dict,
+    ) -> None:
+        download_button.setEnabled(True)
+        close_button.setEnabled(True)
+        main_download_button.setEnabled(True)
+        main_fetch_button.setEnabled(True)
+        thread.quit()
+        thread.wait()
+        worker.deleteLater()
+        thread.deleteLater()
+        if ok:
+            text = f"{message} {result.get('archive_path') or ''}".strip()
+            status_label.setText(text)
+            main_progress_label.setText(text)
+        else:
+            status_label.setText(f"Download failed: {message}")
+            main_progress_label.setText("Download failed")
+            QMessageBox.warning(dialog, PLUGIN_NAME, f"Voice candidate download failed:\n\n{message}")
+
+    def _choose_online_candidate(self, parent: QDialog, row: dict) -> dict | None:
+        candidates = list(row.get("online_candidates") or [])
+        if not candidates and row.get("online_download_url"):
+            candidates = [{
+                "download_name": row.get("online_candidate") or "",
+                "download_url": row.get("online_download_url") or "",
+                "source_url": row.get("online_source_url") or "",
+                "online_score": row.get("online_score") or 0,
+                "size": row.get("online_size") or "",
+                "date_iso": row.get("online_date_iso") or "",
+                "version": row.get("online_version") or "",
+            }]
+
+        candidates = sorted(
+            candidates,
+            key=lambda item: int(item.get("online_score") or 0),
+            reverse=True,
+        )
+        if not candidates:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Selected row has no online candidate yet.")
+            return None
+
+        dialog = QDialog(parent)
+        dialog.setWindowTitle(f"Download voice candidate - {row.get('base_mod') or ''}")
+        dialog.resize(920, 460)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Score", "Candidate", "Size", "Date", "Source"])
+        table.setRowCount(len(candidates))
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table._ll_voice_candidates = candidates
+
+        for index, candidate in enumerate(candidates):
+            score = int(candidate.get("online_score") or 0)
+            for column, value in enumerate([
+                str(score or ""),
+                candidate.get("download_name") or "",
+                candidate.get("size") or "",
+                candidate.get("date_iso") or "",
+                candidate.get("source_url") or "",
+            ]):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(str(value or ""))
+                item.setBackground(self._candidate_background_color(score))
+                item.setForeground(QColor(242, 242, 242))
+                table.setItem(index, column, item)
+
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        if candidates:
+            table.selectRow(0)
+
+        title = QLabel(f"Base mod: {row.get('base_mod') or ''}")
+        title.setStyleSheet("font-weight: 700;")
+        hint = QLabel("Candidates are sorted by score, highest first. Choose the archive to download.")
+        hint.setWordWrap(True)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Download selected")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        table.itemDoubleClicked.connect(lambda _item: dialog.accept())
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addWidget(table)
+        layout.addWidget(buttons)
+        dialog.setLayout(layout)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected = table.selectedItems()
+        if not selected:
+            return None
+        index = selected[0].row()
+        if index < 0 or index >= len(candidates):
+            return None
+        return dict(candidates[index])
+
+    def _download_candidate_finished(
+        self,
+        dialog: QDialog,
+        thread: QThread,
+        worker: VoiceCandidateDownloadWorker,
+        progress_label: QLabel,
+        download_button: QPushButton,
+        fetch_button: QPushButton,
+        ok: bool,
+        message: str,
+        result: dict,
+    ) -> None:
+        download_button.setEnabled(True)
+        fetch_button.setEnabled(True)
+        thread.quit()
+        thread.wait()
+        worker.deleteLater()
+        thread.deleteLater()
+        if ok:
+            progress_label.setText(f"{message} {result.get('archive_path') or ''}")
+        else:
+            progress_label.setText("Download failed")
+            QMessageBox.warning(dialog, PLUGIN_NAME, f"Voice candidate download failed:\n\n{message}")
+
+    def _mo2_downloads_path(self) -> Path | None:
+        if self._organizer:
+            try:
+                path = Path(str(self._organizer.downloadsPath()))
+                if str(path):
+                    return path
+            except Exception:
+                pass
+
+        config = self._read_native_config(self._native_config_path())
+        downloads = config.get("mo2_downloads_path")
+        return Path(str(downloads)) if downloads else None
+
+    def _mark_false_match(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        candidate = row.get("installed_voice") or ""
+        source_url = ""
+        if not candidate:
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "Selected row has no installed/local voice candidate to mark.\n\n"
+                "Use Choose / Download > Hide online match for online candidates.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self._parentWidget(),
+            PLUGIN_NAME,
+            "Hide this candidate from future voice scans?\n\n"
+            f"Base: {row.get('base_mod') or ''}\n"
+            f"Candidate: {candidate}\n\n"
+            "This only affects installed/local voice matching. You can restore it later with the False matches button.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        config = self._load_voice_config()
+        item = {
+            "base": str(row.get("base_internal_name") or row.get("base_mod") or "").lower(),
+            "candidate": str(candidate).lower(),
+            "source_url": str(source_url).lower(),
+        }
+        if item not in config["falseMatches"]:
+            config["falseMatches"].append(item)
+        manual_matches = dict(config.get("manualVoiceMatches") or {})
+        manual_matches.pop(item["base"], None)
+        config["manualVoiceMatches"] = manual_matches
+        self._save_voice_config(config)
+
+        row["online_candidate"] = ""
+        row["online_download_url"] = ""
+        row["online_source_url"] = ""
+        row["online_score"] = 0
+        if candidate == row.get("installed_voice"):
+            row["installed_voice"] = ""
+            row["installed_voice_internal_name"] = ""
+            row["score"] = 0
+            row["manual_voice"] = False
+            row["status"] = "Missing"
+        self._fill_table_row(table, self._selected_table_index(table), row)
+        self._apply_filter(table, filter_mode, filter_text, count_label)
+
+    def _manage_false_matches(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        config = self._load_voice_config()
+        false_matches = list(config.get("falseMatches") or [])
+        if not false_matches:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "No false matches are saved.")
+            return
+
+        dialog = QDialog(self._parentWidget())
+        dialog.setWindowTitle("False voice matches")
+        dialog.resize(860, 420)
+
+        items = QListWidget(dialog)
+        for item in false_matches:
+            base = item.get("base") or ""
+            candidate = item.get("candidate") or ""
+            source_url = item.get("source_url") or ""
+            label = f"{base} -> {candidate}"
+            if source_url:
+                label = f"{label} | {source_url}"
+            items.addItem(label)
+
+        hint = QLabel("Remove selected entries to let them appear again after the next Fetch sources / scan.")
+        hint.setWordWrap(True)
+        remove_selected = QPushButton("Remove selected")
+        close = QPushButton("Close")
+
+        def remove_items() -> None:
+            selected = sorted((item.row() for item in items.selectedIndexes()), reverse=True)
+            if not selected:
+                QMessageBox.information(dialog, PLUGIN_NAME, "Select a false match first.")
+                return
+            for index in selected:
+                if 0 <= index < len(false_matches):
+                    false_matches.pop(index)
+                    items.takeItem(index)
+            config["falseMatches"] = false_matches
+            self._save_voice_config(config)
+            self._apply_filter(table, filter_mode, filter_text, count_label)
+
+        remove_selected.clicked.connect(lambda _checked=False: remove_items())
+        close.clicked.connect(dialog.accept)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(remove_selected)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(hint)
+        layout.addWidget(items)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def _toggle_ignore(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
+        config = self._load_voice_config()
+        ignored = {str(value).lower() for value in config.get("ignoredBaseMods", [])}
+        if key in ignored:
+            ignored.remove(key)
+            row["status"] = "Installed" if int(row.get("score") or 0) >= 90 else "Possible" if int(row.get("score") or 0) >= 55 else "Missing"
+            if row.get("online_candidate") and row["status"] == "Missing":
+                row["status"] = "Online found"
+        else:
+            ignored.add(key)
+            row["status"] = "Ignored"
+        config["ignoredBaseMods"] = sorted(ignored)
+        self._save_voice_config(config)
+        self._fill_table_row(table, self._selected_table_index(table), row)
+        self._apply_filter(table, filter_mode, filter_text, count_label)
+
+    def _classify_selected_mod(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
+        if not key:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Selected row cannot be classified.")
+            return
+
+        current = str(row.get("classification_override") or "auto")
+        labels = [
+            "Auto",
+            "Base mod",
+            "Voice pack",
+        ]
+        current_index = {"auto": 0, "base": 1, "voice": 2}.get(current, 0)
+        selected, ok = QInputDialog.getItem(
+            self._parentWidget(),
+            "Classify LL mod",
+            f"{row.get('base_mod') or ''}\n\nTreat this mod as:",
+            labels,
+            current_index,
+            False,
+        )
+        if not ok:
+            return
+
+        config = self._load_voice_config()
+        forced_voice = {str(value).lower() for value in config.get("forcedVoiceMods", [])}
+        forced_base = {str(value).lower() for value in config.get("forcedBaseMods", [])}
+
+        forced_voice.discard(key)
+        forced_base.discard(key)
+
+        if selected == "Voice pack":
+            forced_voice.add(key)
+        elif selected == "Base mod":
+            forced_base.add(key)
+
+        config["forcedVoiceMods"] = sorted(forced_voice)
+        config["forcedBaseMods"] = sorted(forced_base)
+        self._save_voice_config(config)
+
+        row_index = self._selected_table_index(table)
+        if selected == "Voice pack":
+            rows = getattr(table, "_ll_voice_rows", [])
+            if 0 <= row_index < len(rows):
+                rows.pop(row_index)
+                table.removeRow(row_index)
+            self._apply_filter(table, filter_mode, filter_text, count_label)
+            QMessageBox.information(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "Saved as Voice pack.\n\nIt was removed from the base-mod list and will be used as a voice candidate on the next scan.",
+            )
+            return
+
+        row["classification_override"] = "base" if selected == "Base mod" else "auto"
+        self._fill_table_row(table, row_index, row)
+        self._apply_filter(table, filter_mode, filter_text, count_label)
+
+    def _show_voice_mods_inventory(self, parent: QDialog) -> None:
+        if not self._organizer:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "MO2 organizer is not available.")
+            return
+
+        config = self._load_voice_config()
+        forced_voice_mods = {str(value).lower() for value in config.get("forcedVoiceMods", [])}
+        forced_base_mods = {str(value).lower() for value in config.get("forcedBaseMods", [])}
+        mod_list = self._organizer.modList()
+        voice_mods = []
+        for internal_name in mod_list.allModsByProfilePriority():
+            mod = mod_list.getMod(internal_name)
+            if mod is None:
+                continue
+            key = str(internal_name).lower()
+            display_name = mod_list.displayName(internal_name)
+            is_voice = (voice_keyword_present(display_name) or key in forced_voice_mods) and key not in forced_base_mods
+            if not is_voice:
+                continue
+            path = mod_root_path(mod)
+            meta_path = path / MOD_META_FILE
+            install_time = meta_path.stat().st_mtime if meta_path.exists() else path.stat().st_mtime if path.exists() else 0
+            voice_mods.append({
+                "display_name": display_name,
+                "internal_name": internal_name,
+                "mod_path": str(path),
+                "installed_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(install_time)) if install_time else "",
+                "install_time": install_time,
+                "classification": "Forced voice" if key in forced_voice_mods else "Auto voice",
+            })
+
+        if not voice_mods:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "No installed voice-like mods were found.")
+            return
+
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Installed voice mods")
+        dialog.resize(940, 520)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Voice mod", "Installed", "Class", "Internal", "Folder"])
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table._ll_voice_inventory = voice_mods
+
+        filter_text = QLineEdit(dialog)
+        filter_text.setPlaceholderText("Filter voice mod / folder")
+        filter_text.setClearButtonEnabled(True)
+        sort_mode = QComboBox(dialog)
+        sort_mode.addItems(["Name A-Z", "Name Z-A", "Newest first", "Oldest first"])
+        count_label = QLabel(dialog)
+
+        def populate() -> None:
+            needle = filter_text.text().strip().lower()
+            sort_text = sort_mode.currentText()
+            rows = [
+                item for item in voice_mods
+                if not needle or needle in " ".join([
+                    item.get("display_name") or "",
+                    item.get("internal_name") or "",
+                    item.get("mod_path") or "",
+                    item.get("classification") or "",
+                ]).lower()
+            ]
+            if sort_text == "Name Z-A":
+                rows.sort(key=lambda item: str(item.get("display_name") or "").lower(), reverse=True)
+            elif sort_text == "Newest first":
+                rows.sort(key=lambda item: float(item.get("install_time") or 0), reverse=True)
+            elif sort_text == "Oldest first":
+                rows.sort(key=lambda item: float(item.get("install_time") or 0))
+            else:
+                rows.sort(key=lambda item: str(item.get("display_name") or "").lower())
+
+            table.setRowCount(len(rows))
+            table._ll_voice_inventory_visible = rows
+            for row_index, item in enumerate(rows):
+                for column, value in enumerate([
+                    item.get("display_name") or "",
+                    item.get("installed_at") or "",
+                    item.get("classification") or "",
+                    item.get("internal_name") or "",
+                    item.get("mod_path") or "",
+                ]):
+                    cell = QTableWidgetItem(str(value or ""))
+                    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    cell.setToolTip(str(value or ""))
+                    table.setItem(row_index, column, cell)
+            count_label.setText(f"{len(rows)} / {len(voice_mods)}")
+            if rows:
+                table.selectRow(0)
+
+        def open_selected() -> None:
+            selected = table.selectedItems()
+            rows = getattr(table, "_ll_voice_inventory_visible", [])
+            if not selected:
+                return
+            index = selected[0].row()
+            if index < 0 or index >= len(rows):
+                return
+            path = Path(str(rows[index].get("mod_path") or ""))
+            if path.exists():
+                self._open_path(path)
+
+        filter_text.textChanged.connect(lambda _text: populate())
+        sort_mode.currentTextChanged.connect(lambda _text: populate())
+        table.itemDoubleClicked.connect(lambda _item: open_selected())
+
+        open_folder = QPushButton("Open selected folder")
+        open_folder.clicked.connect(lambda _checked=False: open_selected())
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Filter"))
+        controls.addWidget(filter_text, 1)
+        controls.addWidget(QLabel("Sort"))
+        controls.addWidget(sort_mode)
+        controls.addWidget(count_label)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(open_folder)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+
+        layout = QVBoxLayout(dialog)
+        layout.addLayout(controls)
+        layout.addWidget(table)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+        populate()
+        dialog.exec()
+
+    def _selected_table_index(self, table: QTableWidget) -> int:
+        selected = table.selectedItems()
+        return selected[0].row() if selected else -1
+
+    def _search_selected_voice(self, table: QTableWidget) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+
+        query = row.get("search_query") or row.get("base_mod") or ""
+        if not query:
+            return
+
+        url = "https://www.google.com/search?q=" + quote_plus(
+            f"site:loverslab.com/files/file/ {query}"
+        )
+        webbrowser.open(url)
 
 class LoversLabPathsTool(LoversLabBaseTool):
     TOOL_NAME = "LL Integration Paths"

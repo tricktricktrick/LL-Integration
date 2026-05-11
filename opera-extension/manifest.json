@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "LL Integration",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "description": "Bridge LoversLab and external archive downloads into Mod Organizer 2.",
     "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7tjUle1vegu+NWyvjfgACOtur+3ndFOrGXDP2sUPPRxef1UEziSwIIRd8U9mE1b70KWaBlJLOG3JOEGrqRVNzkkZUgTIJ5Vd6PcD2Rd+24YcA7DlNwYPUpXbydk1Q2HMSvmlikcyC64wIotLPpno/+rMZ7tp51hwOgS0Dj9iTtyFBKWovkvTe2OUWmDNXKbrA4mwYLGkFN1JwLvzaYMzZ4BVlEFWr3b29lPrjthSaAF7jqO4KeHqn8wQBRmF54V7WKl5/+nvXUTnkjG3SlplXJ/ODwqAethGhiqQE6DWRAeCBxd/Lt7sUwiS8uitF8ne6LqGR2F+u4ydHGIYRcviRwIDAQAB",
     "icons": {
@@ -21,7 +21,9 @@
     ],
     "host_permissions": [
         "https://www.loverslab.com/*",
-        "https://loverslab.com/*"
+        "https://loverslab.com/*",
+        "https://dwemermods.com/*",
+        "https://www.dwemermods.com/*"
     ],
     "background": {
         "service_worker": "background.js"
@@ -30,7 +32,9 @@
         {
             "matches": [
                 "https://www.loverslab.com/*",
-                "https://loverslab.com/*"
+                "https://loverslab.com/*",
+                "https://dwemermods.com/*",
+                "https://www.dwemermods.com/*"
             ],
             "js": ["content.js"]
         }
