@@ -182,7 +182,7 @@ function floatingStatusLabel() {
     }
     return `${floatingControlsFollow ? "Follow armed" : "Armed"}: ${label}`;
   }
-  return floatingControlsFollow ? "Follow idle" : "Idle";
+  return floatingControlsFollow ? "Armed: waiting for page" : "Idle";
 }
 
 function syncFloatingControlsStatus(visible = true) {
@@ -194,7 +194,7 @@ function syncFloatingControlsStatus(visible = true) {
     {
       action: "floating_controls_status",
       source: "firefox",
-      armed: Boolean(getPendingLLDownload() || getExternalArchiveCapture()),
+      armed: Boolean(getPendingLLDownload() || getExternalArchiveCapture() || floatingControlsFollow),
       follow: floatingControlsFollow,
       label: floatingStatusLabel(),
       visible
@@ -681,6 +681,14 @@ browser.downloads.onCreated.addListener(async (item) => {
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tabInfo) => {
   if (tabInfo && tabInfo.active && isWebTab(tabInfo)) {
     rememberFloatingControlsTarget(tabInfo);
+    if (floatingControlsFollow) {
+      tabById(tabId).then(tab => {
+        if (tab) {
+          armCaptureForTab(tab);
+          syncFloatingControlsStatus(true);
+        }
+      });
+    }
   }
 
   const capture = getExternalArchiveCapture();
@@ -712,7 +720,7 @@ browser.tabs.onActivated.addListener((activeInfo) => {
     }
 
     const capture = getExternalArchiveCapture();
-    if (floatingControlsFollow && capture) {
+    if (floatingControlsFollow) {
       if (tab) {
         armCaptureForTab(tab);
         syncFloatingControlsStatus(true);

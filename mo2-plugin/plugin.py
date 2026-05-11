@@ -942,7 +942,7 @@ class LoversLabBaseTool(mobase.IPluginTool):
         return self.TOOL_DESCRIPTION
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo("0.2.1")
+        return mobase.VersionInfo("0.3.0")
 
     def settings(self) -> Sequence[mobase.PluginSetting]:
         paths = self._configured_paths()
@@ -5836,7 +5836,7 @@ class LoversLabInstallBinder(mobase.IPluginInstallerSimple):
         return "Binds LoversLab sidecar metadata to a mod after installation."
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo("0.2.1")
+        return mobase.VersionInfo("0.3.0")
 
     def settings(self) -> Sequence[mobase.PluginSetting]:
         return []
@@ -6024,7 +6024,7 @@ class LoversLabInstallObserver(mobase.IPlugin):
         return "Binds LoversLab metadata when MO2 reports a new mod installation."
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo("0.2.1")
+        return mobase.VersionInfo("0.3.0")
 
     def settings(self) -> Sequence[mobase.PluginSetting]:
         return []

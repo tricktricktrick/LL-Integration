@@ -265,7 +265,7 @@ async function floatingStatusLabel() {
     }
     return `${floatingControlsFollow ? "Follow armed" : "Armed"}: ${label}`;
   }
-  return floatingControlsFollow ? "Follow idle" : "Idle";
+  return floatingControlsFollow ? "Armed: waiting for page" : "Idle";
 }
 
 async function syncFloatingControlsStatus(visible = true) {
@@ -280,7 +280,7 @@ async function syncFloatingControlsStatus(visible = true) {
       {
         action: "floating_controls_status",
         source: "opera",
-        armed: Boolean(pending || capture),
+        armed: Boolean(pending || capture || floatingControlsFollow),
         follow: floatingControlsFollow,
         label: await floatingStatusLabel(),
         visible
@@ -885,6 +885,13 @@ ext.downloads.onCreated.addListener(async (item) => {
 ext.tabs.onUpdated.addListener((tabId, changeInfo, tabInfo) => {
   if (tabInfo && tabInfo.active && isWebTab(tabInfo)) {
     rememberFloatingControlsTarget(tabInfo);
+    if (floatingControlsFollow) {
+      tabById(tabId).then((tab) => {
+        if (tab) {
+          armCaptureForTab(tab).then(() => syncFloatingControlsStatus(true));
+        }
+      });
+    }
   }
 
   if (!changeInfo.url && !changeInfo.title) {
@@ -921,7 +928,7 @@ ext.tabs.onActivated.addListener((activeInfo) => {
 
     return getExternalArchiveCapture().then((capture) => ({ capture, tab }));
   }).then(({ capture, tab }) => {
-    if (floatingControlsFollow && capture) {
+    if (floatingControlsFollow) {
       if (tab) {
         armCaptureForTab(tab).then(() => syncFloatingControlsStatus(true));
       }
