@@ -151,3 +151,46 @@ button:disabled {
   color: #aeb8b1;
   font-size: 11px;
 }
+
+.manager-shell {
+  position: relative;
+}
+
+.manager-panel {
+  display: none;
+}
+
+.manager-panel.active {
+  display: grid;
+}
+
+.panel-title {
+  color: #75f0a0;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 28px 2px 2px;
+}
+
+.manager-swap {
+  position: absolute;
+  z-index: 5;
+  right: -6px;
+  top: 28px;
+  width: 18px;
+  height: calc(100% - 28px);
+  min-height: 90px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid #46524b;
+  background: #242a2d;
+  color: #75f0a0;
+  font-size: 18px;
+  font-weight: 900;
+}
+
+.manager-swap:hover {
+  background: #304037;
+  border-color: #2fc777;
+}

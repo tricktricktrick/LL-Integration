@@ -24,8 +24,13 @@ QUICK_HASH_CHUNK_SIZE = 1024 * 1024
 DEFAULT_CONFIG = {
     "mo2_path": "",
     "mo2_downloads_path": "",
+    "vortex_downloads_path": "",
+    "active_downloads_target": "mo2",
+    "download_routing_mode": "auto_open_manager",
+    "when_both_managers_open": "both",
     "metadata_path": str(BASE_DIR / "metadata"),
     "copy_archives_to_mo2_downloads": True,
+    "copy_archives_to_vortex_downloads": True,
     "overwrite_existing_downloads": True,
     "floating_controls_enabled": False,
 }
@@ -117,13 +122,23 @@ def source_type_for_event(event):
     source_type = str(event.get("sourceType") or "").strip().lower()
     if source_type:
         return source_type
+
     if event.get("action") == "capture_external_archive":
         return "external"
+
     page_url = str(event.get("pageUrl") or "")
-    host = urlparse(page_url).hostname or ""
+    host = (urlparse(page_url).hostname or "").lower()
+
+    if host == "www.loverslab.com" or host == "loverslab.com" or host.endswith(".loverslab.com"):
+        return "loverslab"
+
+    if host == "www.nexusmods.com" or host == "nexusmods.com" or host.endswith(".nexusmods.com"):
+        return "nexus"
+
     if host == "dwemermods.com" or host.endswith(".dwemermods.com"):
         return "dwemermods"
-    return "loverslab"
+
+    return "external"
 
 def source_update_supported(source_type):
     return source_type == "loverslab"
@@ -148,6 +163,38 @@ def write_floating_controls_state(update):
     state.update(update)
     save_json_atomic(FLOATING_CONTROLS_STATE_FILE, state)
     return state
+
+def process_name_running(names):
+    wanted = {name.lower() for name in names}
+
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            output = result.stdout.lower()
+            return any(name.lower() in output for name in wanted)
+        except Exception:
+            return False
+
+    return False
+
+
+def mo2_is_running(config):
+    return process_name_running([
+        "ModOrganizer.exe",
+        "ModOrganizer2.exe",
+    ])
+
+
+def vortex_is_running(config):
+    return process_name_running([
+        "Vortex.exe",
+    ])
 
 def process_is_running(pid):
     try:
@@ -290,28 +337,18 @@ def unique_path(path):
             return candidate
         counter += 1
 
-def copy_archive_to_mo2_downloads(archive, config):
-    if not config.get("copy_archives_to_mo2_downloads", True):
-        return archive, None
+def active_downloads_path(config):
+    target = str(config.get("active_downloads_target") or "mo2").lower()
+    if target == "vortex":
+        vortex_text = str(config.get("vortex_downloads_path") or "").strip()
+        if vortex_text:
+            return Path(vortex_text)
+    mo2_text = str(config.get("mo2_downloads_path") or "").strip()
+    if mo2_text:
+        return Path(mo2_text)
+    vortex_text = str(config.get("vortex_downloads_path") or "").strip()
+    return Path(vortex_text) if vortex_text else None
 
-    downloads_path = Path(str(config.get("mo2_downloads_path") or ""))
-    if not downloads_path:
-        return archive, None
-
-    downloads_path.mkdir(parents=True, exist_ok=True)
-    target = downloads_path / archive.name
-    if archive.resolve() == target.resolve():
-        return archive, None
-
-    if not config.get("overwrite_existing_downloads", True):
-        target = unique_path(target)
-
-    try:
-        shutil.copy2(archive, target)
-    except OSError as exc:
-        return archive, str(exc)
-
-    return target, None
 
 def ll_ini_lines(event, archive_path=None, browser_download_url=None, completed_at=None):
     download = event.get("download") or {}
@@ -322,6 +359,10 @@ def ll_ini_lines(event, archive_path=None, browser_download_url=None, completed_
     update_supported = source_update_supported(source_type)
     file_name = download.get("name") or (archive.name if archive else "")
     download_url = download.get("url") or browser_download_url or ""
+    version = str(download.get("version") or "").strip()
+    if not version and not update_supported:
+        version = "0.0.0"
+
     return [
         "[LoversLab]",
         f"source={ini_value(source_type)}",
@@ -335,7 +376,7 @@ def ll_ini_lines(event, archive_path=None, browser_download_url=None, completed_
         f"archive_name={ini_value(archive.name if archive else file_name)}",
         f"archive_size_bytes={ini_value(archive_size)}",
         f"archive_quick_hash={ini_value(quick_hash)}",
-        f"version={ini_value(download.get('version'))}",
+        f"version={ini_value(version)}",
         f"size={ini_value(download.get('size'))}",
         f"date_iso={ini_value(download.get('date_iso'))}",
         f"captured_at={ini_value(event.get('capturedAt'))}",
@@ -360,7 +401,7 @@ def is_archive(path):
 def write_sidecar_files(archive_path, event, browser_download_url, completed_at):
     config = load_config()
     source_archive = Path(archive_path)
-    archive, copy_error = copy_archive_to_mo2_downloads(source_archive, config)
+    archive, copy_error, copied_targets = copy_archive_to_manager_downloads(source_archive, config)
     if not is_archive(archive):
         raise ValueError(f"Not a supported archive: {archive}")
 
@@ -383,9 +424,19 @@ def write_sidecar_files(archive_path, event, browser_download_url, completed_at)
         "browserDownloadUrl": browser_download_url,
         "completedAt": completed_at,
         "event": event,
+        "copiedTargets": copied_targets,
     }
 
     ini_text = "\n".join(ll_ini_lines(event, archive, browser_download_url, completed_at))
+
+    for copied in copied_targets:
+        copied_archive = Path(copied.get("archivePath") or "")
+        if copied_archive.exists():
+            copied_ini = copied_archive.with_name(f"{copied_archive.name}.ll.ini")
+            copied_json = copied_archive.with_name(f"{copied_archive.name}.ll.json")
+            copied_ini.write_text(ini_text, encoding="utf-8")
+            save_json(copied_json, payload)
+
     ini_path.write_text(ini_text, encoding="utf-8")
     save_json(json_path, payload)
     metadata_ini_path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,18 +444,178 @@ def write_sidecar_files(archive_path, event, browser_download_url, completed_at)
     save_json(metadata_json_path, payload)
     return ini_path, json_path, metadata_ini_path, metadata_json_path, archive, copy_error
 
+def copy_archive_to_manager_downloads(archive, config):
+    targets = manager_download_targets(config)
+
+    if not targets:
+        return archive, None, []
+
+    copied = []
+    errors = []
+
+    for manager, downloads_path in targets:
+        if manager == "mo2" and not config.get("copy_archives_to_mo2_downloads", True):
+            continue
+        if manager == "vortex" and not config.get("copy_archives_to_vortex_downloads", True):
+            continue
+
+        downloads_path.mkdir(parents=True, exist_ok=True)
+        target = downloads_path / archive.name
+
+        if archive.resolve() != target.resolve():
+            if target.exists() and not config.get("overwrite_existing_downloads", True):
+                target = unique_path(target)
+
+            try:
+                shutil.copy2(archive, target)
+            except OSError as exc:
+                errors.append(f"{manager}: {exc}")
+                continue
+
+        copied.append({
+            "manager": manager,
+            "archivePath": str(target),
+        })
+
+    primary = Path(copied[0]["archivePath"]) if copied else archive
+    copy_error = "; ".join(errors) if errors else None
+    return primary, copy_error, copied
+
+def manager_download_targets(config):
+    mode = str(config.get("download_routing_mode") or "auto_open_manager").lower()
+    both_policy = str(config.get("when_both_managers_open") or "both").lower()
+
+    mo2_open = mo2_is_running(config)
+    vortex_open = vortex_is_running(config)
+
+    mo2_text = str(config.get("mo2_downloads_path") or "").strip()
+    vortex_text = str(config.get("vortex_downloads_path") or "").strip()
+
+    mo2_path = Path(mo2_text) if mo2_text else None
+    vortex_path = Path(vortex_text) if vortex_text else None
+
+    targets = []
+
+    if mode == "manual":
+        active = str(config.get("active_downloads_target") or "mo2").lower()
+        if active == "vortex" and vortex_path:
+            targets.append(("vortex", vortex_path))
+        elif mo2_path:
+            targets.append(("mo2", mo2_path))
+        elif vortex_path:
+            targets.append(("vortex", vortex_path))
+        return targets
+
+    if mo2_open and vortex_open:
+        if both_policy == "vortex":
+            if vortex_path:
+                targets.append(("vortex", vortex_path))
+        elif both_policy == "mo2":
+            if mo2_path:
+                targets.append(("mo2", mo2_path))
+        else:
+            if mo2_path:
+                targets.append(("mo2", mo2_path))
+            if vortex_path:
+                targets.append(("vortex", vortex_path))
+        return targets
+
+    if vortex_open and vortex_path:
+        targets.append(("vortex", vortex_path))
+        return targets
+
+    if mo2_open and mo2_path:
+        targets.append(("mo2", mo2_path))
+        return targets
+
+    active = str(config.get("active_downloads_target") or "mo2").lower()
+    if active == "vortex" and vortex_path:
+        targets.append(("vortex", vortex_path))
+    elif mo2_path:
+        targets.append(("mo2", mo2_path))
+    elif vortex_path:
+        targets.append(("vortex", vortex_path))
+
+    return targets
+
 def status_payload():
     config = load_config()
+
     mo2_path = Path(str(config.get("mo2_path") or ""))
     mo2_root = mo2_path.parent if mo2_path else Path("")
     plugins_path = mo2_root / "plugins" if mo2_root else Path("")
     plugin_path = plugins_path / "ll_integration" if plugins_path else Path("")
-    downloads_path = Path(str(config.get("mo2_downloads_path") or ""))
+
+    downloads_text = str(config.get("mo2_downloads_path") or "").strip()
+    downloads_path = Path(downloads_text) if downloads_text else Path("")
+
     metadata_path = Path(str(config.get("metadata_path") or ""))
+
     active_instance_path = Path(str(config.get("active_mo2_instance_path") or ""))
     active_plugin_path = Path(str(config.get("active_mo2_plugin_path") or ""))
     active_game = str(config.get("active_mo2_game") or "").strip()
     active_synced_at = str(config.get("active_mo2_synced_at") or "").strip()
+
+    vortex_state_candidates = []
+
+    configured_vortex_state = str(config.get("vortex_state_path") or "").strip()
+    if configured_vortex_state:
+        vortex_state_candidates.append(Path(configured_vortex_state))
+
+    vortex_state_candidates.extend([
+        BASE_DIR / "vortex_state.json",
+        BASE_DIR / "vortex" / "vortex_state.json",
+        BASE_DIR / "vortex_state" / "vortex_state.json",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "LLIntegration" / "native-app" / "vortex_state.json",
+        Path(os.environ.get("APPDATA", "")) / "Vortex" / "ll_integration" / "vortex_state.json",
+    ])
+
+    vortex_state_path = next(
+        (p for p in vortex_state_candidates if p and p.exists()),
+        vortex_state_candidates[0]
+    )
+    vortex_state = load_json_object(vortex_state_path, {})
+
+    vortex_downloads_text = str(
+        config.get("vortex_downloads_path")
+        or vortex_state.get("downloadsPath")
+        or vortex_state.get("downloadPath")
+        or ""
+    ).strip()
+    vortex_downloads_path = Path(vortex_downloads_text) if vortex_downloads_text else Path("")
+
+    active_vortex_game = str(
+        config.get("active_vortex_game")
+        or vortex_state.get("activeGameId")
+        or vortex_state.get("gameId")
+        or ""
+    ).strip()
+
+    active_vortex_profile = str(
+        config.get("active_vortex_profile")
+        or vortex_state.get("activeProfileName")
+        or vortex_state.get("profileName")
+        or vortex_state.get("activeProfileId")
+        or vortex_state.get("profileId")
+        or ""
+    ).strip()
+
+    active_vortex_synced_at = str(
+        config.get("active_vortex_synced_at")
+        or vortex_state.get("capturedAt")
+        or vortex_state.get("syncedAt")
+        or ""
+    ).strip()
+
+    vortex_staging_text = str(
+        config.get("vortex_staging_path")
+        or config.get("vortex_mods_path")
+        or vortex_state.get("stagingPath")
+        or vortex_state.get("modsPath")
+        or vortex_state.get("installPath")
+        or ""
+    ).strip()
+    vortex_staging_path = Path(vortex_staging_text) if vortex_staging_text else Path("")
 
     return {
         "ok": True,
@@ -427,10 +638,33 @@ def status_payload():
             "activeGame": active_game,
             "activeSyncedAt": active_synced_at,
         },
+        "vortex": {
+            "statePath": str(vortex_state_path),
+            "stateExists": vortex_state_path.exists(),
+            "running": vortex_is_running(config),
+            "downloadsPath": str(vortex_downloads_path),
+            "downloadsExists": bool(vortex_downloads_text) and vortex_downloads_path.exists(),
+            "stagingPath": str(vortex_staging_path),
+            "stagingExists": bool(vortex_staging_text) and vortex_staging_path.exists(),
+            "activeGame": active_vortex_game,
+            "activeProfile": active_vortex_profile,
+            "activeSyncedAt": active_vortex_synced_at,
+            "modCount": len(vortex_state.get("mods") or []),
+            "downloadCount": len(vortex_state.get("downloads") or []),
+            "stateCandidates": [str(p) for p in vortex_state_candidates],
+            "downloadsParent": str(vortex_downloads_path.parent) if vortex_downloads_text else "",
+            "downloadsParentExists": bool(vortex_downloads_text) and vortex_downloads_path.parent.exists(),
+            "stagingParent": str(vortex_staging_path.parent) if vortex_staging_text else "",
+            "stagingParentExists": bool(vortex_staging_text) and vortex_staging_path.parent.exists(),
+        },
         "downloads": {
             "path": str(downloads_path),
-            "exists": downloads_path.exists(),
+            "exists": bool(downloads_text) and downloads_path.exists(),
+            "vortexPath": str(vortex_downloads_path),
+            "vortexExists": bool(vortex_downloads_text) and vortex_downloads_path.exists(),
+            "activeTarget": str(config.get("active_downloads_target") or "mo2"),
             "copyArchivesToMo2Downloads": bool(config.get("copy_archives_to_mo2_downloads", True)),
+            "copyArchivesToVortexDownloads": bool(config.get("copy_archives_to_vortex_downloads", True)),
             "overwriteExistingDownloads": bool(config.get("overwrite_existing_downloads", True)),
         },
         "metadata": {
@@ -525,6 +759,7 @@ def main():
         if request_id is not None and isinstance(response, dict):
             response["requestId"] = request_id
         send_message(response)
+
 
 if __name__ == "__main__":
     main()

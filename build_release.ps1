@@ -83,6 +83,7 @@ Invoke-Checked {
         --clean `
         --onefile `
         --console `
+        --icon "native-app\icons\ll_integration.ico" `
         --name "ll_integration_native" `
         "native-app\main.py"
 } "Native helper build"
@@ -97,21 +98,40 @@ Invoke-Checked {
         --clean `
         --onefile `
         --windowed `
+        --icon "native-app\icons\ll_integration.ico" `
+        --add-data "native-app\icons;icons" `
         --name "ll_integration_overlay" `
         "native-app\overlay.py"
 } "Floating controls build"
 
 Copy-Item -LiteralPath "dist\ll_integration_overlay.exe" -Destination "native-app\ll_integration_overlay.exe" -Force
 
+Write-Host "Building Vortex manager..."
+Remove-IfExists "dist\ll_integration_vortex_manager.exe"
+Invoke-Checked {
+    & $Python -m PyInstaller `
+        --noconfirm `
+        --clean `
+        --onefile `
+        --windowed `
+        --icon "native-app\icons\ll_integration.ico" `
+        --add-data "native-app\icons;icons" `
+        --name "ll_integration_vortex_manager" `
+        "native-app\manager_vortex.py"
+} "Vortex manager build"
+
+Copy-Item -LiteralPath "dist\ll_integration_vortex_manager.exe" -Destination "native-app\ll_integration_vortex_manager.exe" -Force
+
 $commonInstallerArgs = @(
     "--noconfirm",
     "--clean",
     "--onefile",
     "--windowed",
-    "--icon", "installer_icon.png",
-    "--add-data", "installer_icon.png;.",
+    "--icon", "native-app\icons\ll_integration.ico",
+    "--add-data", "native-app\icons;icons",
     "--add-data", "native-app;native-app",
-    "--add-data", "mo2-plugin;mo2-plugin"
+    "--add-data", "mo2-plugin;mo2-plugin",
+    "--add-data", "vortex-extension;vortex-extension"
 )
 
 Write-Host "Building stable installer..."
@@ -120,16 +140,12 @@ Invoke-Checked {
     & $Python -m PyInstaller @commonInstallerArgs --name "LLIntegrationInstaller" "installer.py"
 } "Stable installer build"
 
-Write-Host "Building installer with experimental toolbar..."
-Remove-IfExists "dist\LLIntegrationInstaller-WithToolbar.exe"
-Invoke-Checked {
-    & $Python -m PyInstaller @commonInstallerArgs --name "LLIntegrationInstaller-WithToolbar" "installer.py"
-} "WithToolbar installer build"
-
 Remove-Item -LiteralPath "native-app\ll_integration_native.exe" -Force
 Remove-Item -LiteralPath "native-app\ll_integration_overlay.exe" -Force
+Remove-Item -LiteralPath "native-app\ll_integration_vortex_manager.exe" -Force
 Remove-IfExists "dist\ll_integration_native.exe"
 Remove-IfExists "dist\ll_integration_overlay.exe"
+Remove-IfExists "dist\ll_integration_vortex_manager.exe"
 
 Write-Host "Packaging Opera/Chromium extension..."
 New-ExtensionZip `
@@ -140,5 +156,4 @@ New-ExtensionZip `
 Write-Host ""
 Write-Host "Release artifacts:"
 Write-Host "  dist\LLIntegrationInstaller.exe"
-Write-Host "  dist\LLIntegrationInstaller-WithToolbar.exe"
 Write-Host "  dist\LLIntegration-Opera-MV3.zip"

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "voiceSourceUrls": [
+    "https://www.nexusmods.com/skyrimspecialedition/mods/88908?tab=files"
+  ],
+  "nexusApiKey": "HxcjUpcTHrRQ1P2OYLFDhesxdTtqDv7R1j6BojVfGy4r4lO3iDe3+A==--9b02+bzDsO9NAreV--KxGYv2bBESHNG+x49lw4zg==",
+  "falseMatches": [],
+  "ignoredBaseMods": [],
+  "manualVoiceMatches": {},
+  "forcedVoiceMods": [],
+  "forcedBaseMods": [],
+  "completeVoiceSlots": [],
+  "noneVoiceSlots": [],
+  "localMatchThreshold": 55,
+  "window": {}
+}

@@ -14,44 +14,98 @@
         </div>
       </header>
 
-      <section class="status-list">
-        <div class="status" id="nativeStatus">
-          <span class="dot"></span>
-          <div>
-            <strong>Native bridge</strong>
-            <small>Not checked</small>
-          </div>
-        </div>
-        <div class="status" id="mo2Status">
-          <span class="dot"></span>
-          <div>
-            <strong>MO2 plugin install</strong>
-            <small>Not checked</small>
-          </div>
-        </div>
-        <div class="status" id="activeStatus">
-          <span class="dot"></span>
-          <div>
-            <strong>Active MO2 target</strong>
-            <small>Not checked</small>
-          </div>
-        </div>
-        <div class="status" id="downloadsStatus">
-          <span class="dot"></span>
-          <div>
-            <strong>Target downloads</strong>
-            <small>Not checked</small>
-          </div>
-        </div>
-        <div class="status" id="cookiesStatus">
-          <span class="dot"></span>
-          <div>
-            <strong>LoversLab cookies</strong>
-            <small>Not checked</small>
-          </div>
-        </div>
-      </section>
+      <div class="manager-shell">
+        <button id="managerSwapButton" class="manager-swap" type="button" title="Swap manager">›</button>
 
+        <section class="status-list manager-panel active" id="mo2Panel" data-manager="mo2">
+          <div class="panel-title">MO2 status</div>
+
+          <div class="status" id="nativeStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Native bridge</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="mo2Status">
+            <span class="dot"></span>
+            <div>
+              <strong>MO2 plugin install</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="activeStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Active MO2 target</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="downloadsStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>MO2 downloads</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="cookiesStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>LoversLab cookies</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+        </section>
+
+        <section class="status-list manager-panel" id="vortexPanel" data-manager="vortex">
+          <div class="panel-title">Vortex status</div>
+
+          <div class="status" id="vortexNativeStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Native bridge</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="vortexStateStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Vortex extension state</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="vortexActiveStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Active Vortex target</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="vortexDownloadsStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Vortex downloads</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+
+          <div class="status" id="vortexStagingStatus">
+            <span class="dot"></span>
+            <div>
+              <strong>Vortex staging</strong>
+              <small>Not checked</small>
+            </div>
+          </div>
+        </section>
+      </div>
+      
       <section class="actions">
         <button id="refreshButton" type="button">Check Status</button>
         <button id="exportButton" type="button">Export Cookies</button>

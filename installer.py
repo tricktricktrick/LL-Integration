@@ -30,6 +30,8 @@ CHROMIUM_NATIVE_HOST_KEYS = [
 ROOT_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 INSTALL_ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / APP_NAME
 NATIVE_TARGET = INSTALL_ROOT / "native-app"
+VORTEX_PLUGINS_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "Vortex" / "plugins"
+VORTEX_PLUGIN_TARGET = VORTEX_PLUGINS_DIR / "ll-integration"
 INSTALLER_ICON = ROOT_DIR / "installer_icon.png"
 BG = "#15191d"
 PANEL = "#20262b"
@@ -45,26 +47,15 @@ DISABLED = "#637078"
 
 
 def installer_with_toolbar() -> bool:
-    args = {arg.lower() for arg in sys.argv[1:]}
-    exe_name = Path(sys.argv[0]).stem.lower()
-    if "--without-toolbar" in args or "--stable" in args:
-        return False
-    return (
-        "--with-toolbar" in args
-        or "--experimental" in args
-        or "withtoolbar" in exe_name
-        or "with-toolbar" in exe_name
-        or "experimental" in exe_name
-    )
+    return False
 
 
 class InstallerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.with_toolbar = installer_with_toolbar()
-        self.mode_label = "With Toolbar" if self.with_toolbar else "Stable"
-        self.title(f"LL Integration Installer - {self.mode_label}")
-        self.geometry("680x400")
+        self.mode_label = "Installer"
+        self.title("LL Integration Installer")
+        self.geometry("760x520")
         self.resizable(False, False)
         self.configure(bg=BG)
         self._icon_image = None
@@ -73,9 +64,11 @@ class InstallerApp(tk.Tk):
         existing_state = self._load_existing_install_state()
         self.mo2_exe = tk.StringVar(value=existing_state.get("mo2_path", ""))
         self.downloads_path = tk.StringVar(value=existing_state.get("mo2_downloads_path", ""))
-        self.status = tk.StringVar(value="Choose ModOrganizer.exe to begin.")
+        self.vortex_downloads_path = tk.StringVar(value=existing_state.get("vortex_downloads_path", ""))
+        self.status = tk.StringVar(value="Choose MO2, Vortex, or both to begin.")
         self.delete_data = tk.BooleanVar(value=False)
         self.floating_controls = tk.BooleanVar(value=existing_state.get("floating_controls_enabled", False))
+        self.experimental_toolbar = tk.BooleanVar(value=existing_state.get("experimental_toolbar", False))
 
         self._build_ui()
         self._validate()
@@ -93,7 +86,7 @@ class InstallerApp(tk.Tk):
     def _build_ui(self) -> None:
         pad = {"padx": 14, "pady": 8}
 
-        title = self._label(f"LL Integration Installer - {self.mode_label}", font=("Segoe UI", 16, "bold"))
+        title = self._label(f"LL Integration {self.mode_label}", font=("Segoe UI", 16, "bold"))
         title.pack(anchor="w", **pad)
 
         frame = tk.Frame(self, bg=BG)
@@ -101,8 +94,9 @@ class InstallerApp(tk.Tk):
 
         self._path_row(frame, "ModOrganizer.exe", self.mo2_exe, self._browse_mo2, 0)
         self._path_row(frame, "MO2 downloads folder", self.downloads_path, self._browse_downloads, 1)
+        self._path_row(frame, "Vortex downloads folder", self.vortex_downloads_path, self._browse_vortex_downloads, 2)
 
-        install_text = "Install With Toolbar" if self.with_toolbar else "Install Stable"
+        install_text = "Install"
         self.install_button = self._button(self, install_text, self._install, accent=True, height=2)
         self.install_button.pack(fill="x", padx=14, pady=12)
 
@@ -110,6 +104,18 @@ class InstallerApp(tk.Tk):
             self,
             text="Install optional floating capture controls",
             variable=self.floating_controls,
+            bg=BG,
+            fg=MUTED,
+            activebackground=BG,
+            activeforeground=TEXT,
+            selectcolor=PANEL,
+            highlightthickness=0,
+        ).pack(anchor="w", padx=14, pady=(0, 4))
+
+        tk.Checkbutton(
+            self,
+            text="Enable experimental MO2 toolbar button",
+            variable=self.experimental_toolbar,
             bg=BG,
             fg=MUTED,
             activebackground=BG,
@@ -148,14 +154,11 @@ class InstallerApp(tk.Tk):
         )
 
         note = (
-            "This installs the native bridge in %LOCALAPPDATA%, copies the MO2 plugin, "
+            "This installs the native bridge in %LOCALAPPDATA%, copies the MO2 plugin when MO2 is selected, "
+            "installs a lightweight Vortex extension when a Vortex downloads folder is selected, "
             "and registers browser Native Messaging for the current Windows user. "
             "Floating capture controls are optional and only provide Arm / Disarm / Follow buttons. "
-            + (
-                "This build enables the experimental MO2 toolbar button."
-                if self.with_toolbar
-                else "This build uses the stable Tools > LL Integration menu only."
-            )
+            "Enable the experimental MO2 toolbar checkbox only if you want the extra MO2 toolbar button."
         )
         self._label(note, wraplength=640, fg=MUTED).pack(
             fill="x", padx=14, pady=6
@@ -231,6 +234,12 @@ class InstallerApp(tk.Tk):
             self.downloads_path.set(path)
             self._validate()
 
+    def _browse_vortex_downloads(self) -> None:
+        path = filedialog.askdirectory(title="Select Vortex downloads folder")
+        if path:
+            self.vortex_downloads_path.set(path)
+            self._validate()
+
     def _load_existing_install_state(self) -> dict[str, str]:
         config_path = NATIVE_TARGET / "config.json"
         if not config_path.exists():
@@ -247,32 +256,45 @@ class InstallerApp(tk.Tk):
         state = {}
         mo2_path = str(data.get("mo2_path") or "").strip()
         downloads_path = str(data.get("mo2_downloads_path") or "").strip()
+        vortex_downloads_path = str(data.get("vortex_downloads_path") or "").strip()
         if mo2_path:
             state["mo2_path"] = mo2_path
         if downloads_path:
             state["mo2_downloads_path"] = downloads_path
+        if vortex_downloads_path:
+            state["vortex_downloads_path"] = vortex_downloads_path
+        state["active_downloads_target"] = str(data.get("active_downloads_target") or "mo2")
         state["floating_controls_enabled"] = bool(data.get("floating_controls_enabled", False))
         return state
 
     def _validate(self) -> bool:
         mo2_text = self.mo2_exe.get().strip()
         downloads_text = self.downloads_path.get().strip()
+        vortex_downloads_text = self.vortex_downloads_path.get().strip()
         ok = True
         errors = []
+        mo2_enabled = bool(mo2_text or downloads_text)
+        vortex_enabled = bool(vortex_downloads_text)
 
-        if not mo2_text:
+        if not mo2_enabled and not vortex_enabled:
             ok = False
-            errors.append("Choose ModOrganizer.exe.")
+            errors.append("Choose an MO2 install or a Vortex downloads folder.")
+
+        if mo2_enabled and not mo2_text:
+            ok = False
+            errors.append("Choose ModOrganizer.exe or clear the MO2 downloads folder.")
             mo2_path = None
         else:
-            mo2_path = Path(mo2_text)
+            mo2_path = Path(mo2_text) if mo2_text else None
 
-        if not downloads_text:
+        if mo2_enabled and not downloads_text:
             ok = False
-            errors.append("Choose the MO2 downloads folder.")
+            errors.append("Choose the MO2 downloads folder or clear ModOrganizer.exe.")
             downloads = None
         else:
-            downloads = Path(downloads_text)
+            downloads = Path(downloads_text) if downloads_text else None
+
+        vortex_downloads = Path(vortex_downloads_text) if vortex_downloads_text else None
 
         if mo2_path is None:
             plugins_path = None
@@ -291,9 +313,13 @@ class InstallerApp(tk.Tk):
             ok = False
             errors.append("MO2 downloads folder does not exist.")
 
+        if vortex_downloads is not None and not vortex_downloads.exists():
+            ok = False
+            errors.append("Vortex downloads folder does not exist.")
+
         self.install_button.config(state="normal" if ok else "disabled")
         self.uninstall_button.config(
-            state="normal" if mo2_path is not None and mo2_path.parent.exists() else "disabled"
+            state="normal" if (mo2_path is not None and mo2_path.parent.exists()) or VORTEX_PLUGIN_TARGET.exists() else "disabled"
         )
         if hasattr(self, "status_label"):
             self.status_label.config(fg=GREEN if ok else WARN)
@@ -457,9 +483,13 @@ foreach ($p in $targets) {{
             return
 
         try:
-            mo2_path = Path(self.mo2_exe.get().strip())
-            downloads_path = Path(self.downloads_path.get().strip())
-            mo2_root = mo2_path.parent
+            mo2_text = self.mo2_exe.get().strip()
+            downloads_text = self.downloads_path.get().strip()
+            vortex_downloads_text = self.vortex_downloads_path.get().strip()
+            mo2_path = Path(mo2_text) if mo2_text else None
+            downloads_path = Path(downloads_text) if downloads_text else None
+            vortex_downloads_path = Path(vortex_downloads_text) if vortex_downloads_text else None
+            mo2_root = mo2_path.parent if mo2_path else None
 
             # Prevent the browser extension from keeping the old native host locked
             # while files are being replaced.
@@ -467,19 +497,36 @@ foreach ($p in $targets) {{
             self._stop_running_native_processes()
             self._reset_floating_controls_state()
 
-            self._install_native_app(mo2_path, downloads_path)
-            self._install_mo2_plugin(mo2_root)
+            self._install_native_app(mo2_path, downloads_path, vortex_downloads_path)
+            if mo2_root is not None:
+                self._install_mo2_plugin(mo2_root)
+            if vortex_downloads_path is not None:
+                self._install_vortex_extension(vortex_downloads_path)
 
             self._register_native_messaging()
 
+            managers = []
+            if mo2_root is not None:
+                managers.append("MO2")
+            if vortex_downloads_path is not None:
+                managers.append("Vortex")
+            restart_targets = ["Firefox"]
+            if mo2_root is not None:
+                restart_targets.append("MO2")
+            if vortex_downloads_path is not None:
+                restart_targets.append("Vortex")
+            next_step = f"Restart {', '.join(restart_targets)}, then "
+            if mo2_root is not None and vortex_downloads_path is not None:
+                next_step += "open Tools > LL Integration or the Vortex LL Integration action."
+            elif mo2_root is not None:
+                next_step += "open Tools > LL Integration."
+            else:
+                next_step += "open the Vortex LL Integration action."
+            if self.experimental_toolbar.get() and mo2_root is not None:
+                next_step += " The experimental toolbar button should appear in MO2."
             messagebox.showinfo(
                 "Installed",
-                "LL Integration was installed.\n\n"
-                + (
-                    "Restart Firefox and MO2. The experimental toolbar button should appear in MO2."
-                    if self.with_toolbar
-                    else "Restart Firefox and MO2, then open Tools > LL Integration."
-                ),
+                f"LL Integration was installed for {', '.join(managers)}.\n\n{next_step}",
             )
             self.status.set(f"Installed to {INSTALL_ROOT}")
         except Exception as exc:
@@ -487,13 +534,15 @@ foreach ($p in $targets) {{
             self.status.set(f"Install failed: {exc}")
 
     def _uninstall(self) -> None:
-        mo2_path = Path(self.mo2_exe.get().strip())
-        plugin_path = mo2_path.parent / "plugins" / "ll_integration"
+        mo2_text = self.mo2_exe.get().strip()
+        mo2_path = Path(mo2_text) if mo2_text else None
+        plugin_path = mo2_path.parent / "plugins" / "ll_integration" if mo2_path else None
 
         delete_data = self.delete_data.get()
         detail = (
-            "This will remove the MO2 plugin and browser native messaging registrations.\n\n"
-            f"MO2 plugin:\n{plugin_path}\n\n"
+            "This will remove installed manager plugins and browser native messaging registrations.\n\n"
+            f"MO2 plugin:\n{plugin_path if plugin_path is not None else '(not selected)'}\n\n"
+            f"Vortex extension:\n{VORTEX_PLUGIN_TARGET}\n\n"
             "Native app registrations:\n"
             + "\n".join(f"HKCU\\{key}" for key in FIREFOX_NATIVE_HOST_KEYS + CHROMIUM_NATIVE_HOST_KEYS)
             + "\n\n"
@@ -510,8 +559,10 @@ foreach ($p in $targets) {{
             self._unregister_native_messaging()
             self._stop_running_native_processes()
 
-            if plugin_path.exists():
+            if plugin_path is not None and plugin_path.exists():
                 shutil.rmtree(plugin_path)
+            if VORTEX_PLUGIN_TARGET.exists():
+                shutil.rmtree(VORTEX_PLUGIN_TARGET)
 
             if delete_data and INSTALL_ROOT.exists():
                 shutil.rmtree(INSTALL_ROOT)
@@ -523,7 +574,12 @@ foreach ($p in $targets) {{
             messagebox.showerror("Uninstall failed", str(exc))
             self.status.set(f"Uninstall failed: {exc}")
 
-    def _install_native_app(self, mo2_path: Path, downloads_path: Path) -> None:
+    def _install_native_app(
+        self,
+        mo2_path: Path | None,
+        downloads_path: Path | None,
+        vortex_downloads_path: Path | None,
+    ) -> None:
         NATIVE_TARGET.mkdir(parents=True, exist_ok=True)
         native_exe_source = ROOT_DIR / "native-app" / "ll_integration_native.exe"
         if native_exe_source.exists():
@@ -534,21 +590,27 @@ foreach ($p in $targets) {{
             if stale_run_bat.exists():
                 stale_run_bat.unlink()
         else:
-            for name in ["main.py", "overlay.py"]:
+            for name in ["main.py", "overlay.py", "manager_vortex.py"]:
                 self._copy2_retry(ROOT_DIR / "native-app" / name, NATIVE_TARGET / name)
 
             python_exe = Path(sys.executable)
             run_bat = f'@echo off\r\n"{python_exe}" "{NATIVE_TARGET / "main.py"}"\r\n'
             (NATIVE_TARGET / "run.bat").write_text(run_bat, encoding="utf-8")
             native_launch_path = NATIVE_TARGET / "run.bat"
-
+        
         config = {
-            "mo2_path": str(mo2_path),
-            "mo2_downloads_path": str(downloads_path),
+            "mo2_path": str(mo2_path or ""),
+            "mo2_downloads_path": str(downloads_path or ""),
+            "vortex_downloads_path": str(vortex_downloads_path or ""),
+            "active_downloads_target": "mo2",
+            "download_routing_mode": "auto_open_manager",
+            "when_both_managers_open": "both",
             "metadata_path": str(INSTALL_ROOT / "metadata"),
             "copy_archives_to_mo2_downloads": True,
+            "copy_archives_to_vortex_downloads": True,
             "overwrite_existing_downloads": True,
             "floating_controls_enabled": bool(self.floating_controls.get()),
+            "experimental_toolbar": bool(self.experimental_toolbar.get()),
         }
         (NATIVE_TARGET / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -559,6 +621,14 @@ foreach ($p in $targets) {{
             overlay_py_source = ROOT_DIR / "native-app" / "overlay.py"
             if overlay_py_source.exists():
                 self._copy2_retry(overlay_py_source, NATIVE_TARGET / "overlay.py")
+
+        manager_exe_source = ROOT_DIR / "native-app" / "ll_integration_vortex_manager.exe"
+        if manager_exe_source.exists():
+            self._copy2_retry(manager_exe_source, NATIVE_TARGET / "ll_integration_vortex_manager.exe")
+        else:
+            manager_py_source = ROOT_DIR / "native-app" / "manager_vortex.py"
+            if manager_py_source.exists():
+                self._copy2_retry(manager_py_source, NATIVE_TARGET / "manager_vortex.py")
 
         firefox_manifest = {
             "name": NATIVE_NAME,
@@ -582,6 +652,7 @@ foreach ($p in $targets) {{
             json.dumps(chromium_manifest, indent=2),
             encoding="utf-8",
         )
+        
 
     def _install_mo2_plugin(self, mo2_root: Path) -> None:
         source = ROOT_DIR / "mo2-plugin"
@@ -599,9 +670,17 @@ foreach ($p in $targets) {{
                 if icon.is_file():
                     self._copy2_retry(icon, icons_target / icon.name)
 
+        tutorial_source = ROOT_DIR / "Mo2_ImageTutorial"
+        tutorial_target = target / "Mo2_ImageTutorial"
+        if tutorial_source.exists():
+            if tutorial_target.exists():
+                self._rmtree_retry(tutorial_target)
+            self._copytree_retry(tutorial_source, tutorial_target)
+
         experimental_source = source / "experimental"
         experimental_target = target / "experimental"
-        if self.with_toolbar and experimental_source.exists():
+
+        if self.experimental_toolbar.get() and experimental_source.exists():
             if experimental_target.exists():
                 self._rmtree_retry(experimental_target)
             self._copytree_retry(experimental_source, experimental_target)
@@ -611,9 +690,28 @@ foreach ($p in $targets) {{
         plugin_paths = {
             "ll_ini_path": str(NATIVE_TARGET / "downloads_storage" / "latest_ll_download.ini"),
             "cookies_path": str(NATIVE_TARGET / "cookies_storage" / "cookies_ll.json"),
-            "experimental_toolbar": self.with_toolbar,
+            "experimental_toolbar": bool(self.experimental_toolbar.get()),
         }
         (target / "plugin_paths.json").write_text(json.dumps(plugin_paths, indent=2), encoding="utf-8")
+
+    def _install_vortex_extension(self, vortex_downloads_path: Path) -> None:
+        source = ROOT_DIR / "vortex-extension"
+        if not source.exists():
+            raise RuntimeError(f"Vortex extension source was not found: {source}")
+
+        VORTEX_PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        if VORTEX_PLUGIN_TARGET.exists():
+            self._rmtree_retry(VORTEX_PLUGIN_TARGET)
+        self._copytree_retry(source, VORTEX_PLUGIN_TARGET)
+        extension_config = {
+            "nativeAppPath": str(NATIVE_TARGET),
+            "nativeConfigPath": str(NATIVE_TARGET / "config.json"),
+            "vortexDownloadsPath": str(vortex_downloads_path),
+        }
+        (VORTEX_PLUGIN_TARGET / "ll-integration.config.json").write_text(
+            json.dumps(extension_config, indent=2),
+            encoding="utf-8",
+        )
 
     def _register_native_messaging(self) -> None:
         for key_path in FIREFOX_NATIVE_HOST_KEYS:

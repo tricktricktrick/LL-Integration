@@ -1,7 +1,10 @@
 import configparser
+import html as html_lib
 import json
+import queue
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Sequence
@@ -11,9 +14,10 @@ import webbrowser
 
 import mobase
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QAction, QColor, QPixmap
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -30,6 +34,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QHeaderView,
     QLineEdit,
+    QMenu,
+    QSplitter,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -75,7 +81,9 @@ VOICE_KEYWORDS = (
     "voiced",
     "dbvo",
     "dvo",
-    "idtv",
+    "IVDT",
+    "ivdt",
+    "dvit",
     "dialogue voice",
     "dialogue voices",
     "voice pack",
@@ -91,7 +99,9 @@ VOICE_NOISE_WORDS_RE = re.compile(
     \b(
         dbvo
         | dvo
-        | idtv
+        | IVDT
+        | ivdt
+        | dvit
         | voice
         | voices
         | voiced
@@ -114,6 +124,20 @@ VOICE_NOISE_WORDS_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+VOICE_CATEGORIES = (
+    ("npc", "Voicepack"),
+    ("player", "DBVO"),
+    ("scene", "IVDT / IVDT"),
+)
+VOICE_CATEGORY_LABELS = dict(VOICE_CATEGORIES)
+VOICE_CATEGORY_IDS = {label: key for key, label in VOICE_CATEGORIES}
+DEFAULT_VOICE_MATCH_THRESHOLD = 55
+
+NEXUS_SOURCE_RE = re.compile(
+    r"^https?://(?:www\.)?nexusmods\.com/(?P<game>[^/\s?#]+)/mods/(?P<mod_id>\d+)",
+    re.IGNORECASE,
+)
+
 def normalized_voice_name(value: str) -> str:
     text = str(value or "").lower()
     text = re.sub(r"\.(?:7z|zip|rar|tar|gz|bz2|xz)$", " ", text, flags=re.IGNORECASE)
@@ -129,6 +153,19 @@ def voice_keyword_present(value: str) -> bool:
     return any(f" {keyword} " in padded for keyword in VOICE_KEYWORDS)
 
 
+def voice_category_guess(value: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+    padded = f" {text} "
+    if any(token in padded for token in (" dbvo ", " dvo ", " dragonborn voice over ")):
+        return "player"
+    if any(token in padded for token in (" IVDT ", " ivdt ", " dvit ", " dirty talk ", " scene ", " addon ")):
+        return "scene"
+    if any(token in padded for token in (" voicepack ", " voice pack ", " voicefiles ", " voice files ", " npc ", " dialogue ", " dialogues ")):
+        return "npc"
+    if voice_keyword_present(value):
+        return "npc"
+    return ""
+
 def voice_match_score(base_name: str, voice_name: str) -> int:
     base = normalized_voice_name(base_name)
     voice = normalized_voice_name(voice_name)
@@ -143,6 +180,12 @@ def voice_match_score(base_name: str, voice_name: str) -> int:
     elif base in voice or voice in base:
         score += 85
 
+    compact_base = base.replace(" ", "")
+    compact_voice = voice.replace(" ", "")
+    if compact_base and compact_voice and compact_base != compact_voice:
+        if compact_base in compact_voice or compact_voice in compact_base:
+            score += 65
+
     base_tokens = set(base.split())
     voice_tokens = set(voice.split())
     common = base_tokens & voice_tokens
@@ -156,9 +199,165 @@ def voice_match_score(base_name: str, voice_name: str) -> int:
     return min(score, 160)
 
 
+def normalize_voice_source_url(value: str) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if "loverslab.com/files/file/" in url.lower():
+        return with_query_value(url, "do", "download")
+    match = NEXUS_SOURCE_RE.match(url)
+    if match:
+        return f"https://www.nexusmods.com/{match.group('game')}/mods/{match.group('mod_id')}?tab=files"
+    return url
+
+
+def is_nexus_source_url(value: str) -> bool:
+    return bool(NEXUS_SOURCE_RE.match(str(value or "").strip()))
+
+
+def nexus_source_parts(value: str) -> tuple[str, str] | None:
+    match = NEXUS_SOURCE_RE.match(str(value or "").strip())
+    if not match:
+        return None
+    return match.group("game"), match.group("mod_id")
+
+
+def validate_nexus_api_key(api_key: str, timeout: float = 30.0) -> dict:
+    request = Request(
+        "https://api.nexusmods.com/v1/users/validate.json",
+        headers={
+            "apikey": api_key,
+            "User-Agent": "LL Integration",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def fetch_nexus_files_api(game: str, mod_id: str, api_key: str, timeout: float = 30.0) -> list[dict]:
+    url = f"https://api.nexusmods.com/v1/games/{game}/mods/{mod_id}/files.json"
+    request = Request(
+        url,
+        headers={
+            "apikey": api_key,
+            "User-Agent": "LL Integration",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    files = payload.get("files", payload if isinstance(payload, list) else [])
+    if not isinstance(files, list):
+        return []
+    source_url = f"https://www.nexusmods.com/{game}/mods/{mod_id}?tab=files"
+    downloads: list[dict] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        file_id = str(item.get("file_id") or "").strip()
+        name = str(item.get("name") or item.get("file_name") or "").strip()
+        if not file_id or not name:
+            continue
+        size_kb = item.get("size_kb")
+        size = f"{size_kb} KB" if size_kb not in (None, "") else ""
+        downloads.append({
+            "source_url": source_url,
+            "source_title": "Nexus Mods API source",
+            "download_name": name,
+            "download_url": f"https://www.nexusmods.com/{game}/mods/{mod_id}?tab=files&file_id={file_id}&nmm=1",
+            "voice_category": voice_category_guess(name),
+            "size": size,
+            "date_iso": str(item.get("uploaded_time") or ""),
+            "version": str(item.get("version") or item.get("mod_version") or ""),
+            "source_type": "nexus",
+            "nexus_file_id": file_id,
+            "nexus_category": str(item.get("category_name") or ""),
+        })
+    return downloads
+
+
+def fetch_nexus_html(url: str, timeout: float = 30.0) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+                "Gecko/20100101 Firefox/125.0"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Encoding": "identity",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+
+def strip_html_text(value: str) -> str:
+    text = re.sub(r"<script\b.*?</script>", " ", value or "", flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(html_lib.unescape(text).split())
+
+
+def nexus_file_name_from_text(text: str, file_id: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    patterns = [
+        r"([^|]{4,180}?)(?:\s+Date uploaded|\s+File size|\s+Unique DLs|\s+Total DLs|\s+Version|\s+Mod manager download|\s+Manual download)",
+        r"([A-Za-z0-9][^|]{4,180}?)\s+\(?\d+(?:\.\d+)?\s*(?:KB|MB|GB)\)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, re.IGNORECASE)
+        if not match:
+            continue
+        name = match.group(1).strip(" -|")
+        name = re.sub(r"^(Main files|Optional files|Miscellaneous files)\s+", "", name, flags=re.IGNORECASE)
+        if name and file_id not in name:
+            return name[:180]
+    return ""
+
+
+def extract_nexus_downloads(html: str, source_url: str) -> list[dict]:
+    parsed = urlparse(source_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    seen: set[str] = set()
+    downloads: list[dict] = []
+
+    for match in re.finditer(r"(?:file_id=|data-file-id=[\"']?)(\d+)", html or "", re.IGNORECASE):
+        file_id = match.group(1)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        chunk = html[max(0, match.start() - 2200): min(len(html), match.end() + 2200)]
+        text = strip_html_text(chunk)
+        name = nexus_file_name_from_text(text, file_id) or f"Nexus file {file_id}"
+        size_match = re.search(r"\b\d+(?:\.\d+)?\s*(?:KB|MB|GB)\b", text, re.IGNORECASE)
+        date_match = re.search(
+            r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}(?:,\s*\d{1,2}:\d{2}\s*(?:AM|PM)?)?",
+            text,
+        )
+        downloads.append({
+            "source_url": source_url,
+            "source_title": "Nexus Mods source",
+            "download_name": name,
+            "download_url": f"{base_url}?tab=files&file_id={file_id}&nmm=1",
+            "voice_category": voice_category_guess(name),
+            "size": size_match.group(0) if size_match else "",
+            "date_iso": date_match.group(0) if date_match else "",
+            "version": "",
+            "source_type": "nexus",
+            "nexus_file_id": file_id,
+        })
+
+    return downloads
+
+
 def voice_search_query(base_name: str) -> str:
     clean = normalized_voice_name(base_name)
-    return f"{clean} voice OR voices OR DBVO OR IDTV".strip()
+    return f"{clean} voice OR voices OR DBVO OR IVDT".strip()
 
 def normalized_update_mode(value: str | None, fixed: bool = False) -> str:
     mode = str(value or "").strip().lower()
@@ -332,6 +531,8 @@ def write_voice_download_sidecar(
         "multipart=false",
         f"file_pattern={ini_value(download_name)}",
         f"voice_base_mod={ini_value(candidate.get('base_mod') or '')}",
+        f"voice_category={ini_value(candidate.get('voice_category') or '')}",
+        f"voice_category_label={ini_value(candidate.get('voice_category_label') or '')}",
         f"voice_match_score={ini_value(candidate.get('online_score') or candidate.get('score') or '')}",
         "",
     ]
@@ -760,6 +961,27 @@ class CheckAllWorker(QObject):
                 "info": "Skip updates; update fetch skipped",
             }
 
+        return self._check_job_cancelable(job)
+
+    def _check_job_cancelable(self, job: dict) -> dict:
+        result_queue: queue.Queue[dict] = queue.Queue(maxsize=1)
+
+        def run_fetch() -> None:
+            result_queue.put(self._check_job_fetch(job))
+
+        thread = threading.Thread(target=run_fetch, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self._cancelled:
+                return self._cancelled_result(job)
+            thread.join(0.1)
+
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return self._cancelled_result(job)
+
+    def _check_job_fetch(self, job: dict) -> dict:
         try:
             started = time.monotonic()
             result = check_ini_for_updates(Path(job["ini_path"]), self._cookies_path, timeout=self._request_timeout)
@@ -824,6 +1046,21 @@ class CheckAllWorker(QObject):
                 "update_mode": job.get("update_mode") or "",
                 "info": info,
             }
+
+    def _cancelled_result(self, job: dict) -> dict:
+        return {
+            "ini_path": job.get("ini_path") or "",
+            "internal_name": job.get("internal_name") or "",
+            "mod": job["mod"],
+            "status": "Queued",
+            "current": job.get("current") or "",
+            "latest": "",
+            "file": job.get("file") or "",
+            "page_url": job.get("page_url") or "",
+            "fixed": bool(job.get("fixed")),
+            "update_mode": job.get("update_mode") or "",
+            "info": "Cancelled; abandoned current HTTP request in background",
+        }
 
 
 class TryUpdateWorker(QObject):
@@ -1492,6 +1729,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         cancel.setEnabled(False)
         close.clicked.connect(dialog.accept)
 
+
         delay = QDoubleSpinBox(dialog)
         delay.setRange(0.0, 10.0)
         delay.setDecimals(1)
@@ -1683,6 +1921,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         dialog._ll_thread = thread
         dialog._ll_worker = worker
         dialog._ll_fetch_log_path = log_path
+        dialog._ll_progress_label = progress_label
         thread.start()
 
     def _cancel_check_worker(self, dialog: QDialog, cancel: QPushButton) -> None:
@@ -1691,6 +1930,9 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
             worker.cancel()
             cancel.setEnabled(False)
             cancel.setText("Cancelling...")
+            progress_label = getattr(dialog, "_ll_progress_label", None)
+            if progress_label is not None:
+                progress_label.setText("Cancelling after current UI handoff...")
 
     def _start_single_check_worker(
         self,
@@ -1788,6 +2030,7 @@ class LoversLabCheckAllTool(LoversLabBaseTool):
         dialog._ll_thread = thread
         dialog._ll_worker = worker
         dialog._ll_fetch_log_path = log_path
+        dialog._ll_progress_label = progress_label
         thread.start()
 
     def _start_try_update_worker(
@@ -3236,6 +3479,7 @@ class VoiceSourceFetchWorker(QObject):
         source_urls: list[str],
         cookies_path: Path,
         false_matches: list[dict],
+        nexus_api_key: str = "",
         timeout: float = UPDATE_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         super().__init__()
@@ -3243,6 +3487,7 @@ class VoiceSourceFetchWorker(QObject):
         self._source_urls = list(source_urls)
         self._cookies_path = cookies_path
         self._false_matches = list(false_matches)
+        self._nexus_api_key = str(nexus_api_key or "").strip()
         self._timeout = timeout
         self._cancelled = False
 
@@ -3260,18 +3505,30 @@ class VoiceSourceFetchWorker(QObject):
                     return
 
                 self.statusChanged.emit(f"Fetching voice source {index} / {total}: {source_url}")
-                html = fetch_ll_html(source_url, self._cookies_path, timeout=self._timeout)
-                downloads = extract_downloads(html)
-                for download in downloads:
-                    download_candidate = {
-                        "source_url": with_query_value(source_url, "do", "download"),
-                        "source_title": "Voice pack source",
-                        "download_name": download.name,
-                        "download_url": download.url,
-                        "size": download.size or "",
-                        "date_iso": download.date_iso or "",
-                        "version": download.version or "",
-                    }
+                if is_nexus_source_url(source_url):
+                    parts = nexus_source_parts(source_url)
+                    if self._nexus_api_key and parts:
+                        download_candidates = fetch_nexus_files_api(parts[0], parts[1], self._nexus_api_key, timeout=self._timeout)
+                    else:
+                        html = fetch_nexus_html(source_url, timeout=self._timeout)
+                        download_candidates = extract_nexus_downloads(html, source_url)
+                else:
+                    html = fetch_ll_html(source_url, self._cookies_path, timeout=self._timeout)
+                    download_candidates = []
+                    for download in extract_downloads(html):
+                        download_candidates.append({
+                            "source_url": with_query_value(source_url, "do", "download"),
+                            "source_title": "Voice pack source",
+                            "download_name": download.name,
+                            "download_url": download.url,
+                            "voice_category": voice_category_guess(download.name),
+                            "size": download.size or "",
+                            "date_iso": download.date_iso or "",
+                            "version": download.version or "",
+                            "source_type": "loverslab",
+                        })
+
+                for download_candidate in download_candidates:
                     all_downloads.append(dict(download_candidate))
                     best = self._best_base_match(download_candidate)
                     if best:
@@ -3297,6 +3554,12 @@ class VoiceSourceFetchWorker(QObject):
                 continue
 
             score = voice_match_score(row.get("base_mod") or "", candidate.get("download_name") or "")
+            if candidate.get("voice_category") == row.get("voice_category"):
+                score += 20
+            elif row.get("voice_category") and candidate.get("voice_category"):
+                score = 0
+            else:
+                score = max(0, score - 35)
             if score > best_score:
                 best_score = score
                 best = row
@@ -3309,6 +3572,8 @@ class VoiceSourceFetchWorker(QObject):
             "base_mod": best.get("base_mod") or "",
             "base_internal_name": best.get("base_internal_name") or "",
             "base_page_url": best.get("base_page_url") or "",
+            "voice_category": best.get("voice_category") or "",
+            "voice_category_label": best.get("voice_category_label") or "",
             "online_score": best_score,
         })
         return result
@@ -3317,8 +3582,12 @@ class VoiceSourceFetchWorker(QObject):
         base_key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
         candidate_key = str(candidate.get("download_name") or "").lower()
         source_url = str(candidate.get("source_url") or "").lower()
+        category = str(row.get("voice_category") or "").lower()
         for item in self._false_matches:
             if str(item.get("base") or "").lower() != base_key:
+                continue
+            item_category = str(item.get("voice_category") or "").lower()
+            if item_category and category and item_category != category:
                 continue
             if str(item.get("candidate") or "").lower() != candidate_key:
                 continue
@@ -3388,12 +3657,16 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
     COL_STATUS = 0
     COL_BASE_MOD = 1
-    COL_INSTALLED_VOICE = 2
-    COL_SCORE = 3
-    COL_ONLINE = 4
-    COL_ONLINE_SCORE = 5
-    COL_SOURCE = 6
-    COL_PAGE = 7
+    COL_VOICEPACK = 2
+    COL_DBVO = 3
+    COL_IVDT = 4
+    COL_CATEGORY = 5
+    COL_INSTALLED_VOICE = 6
+    COL_SCORE = 7
+    COL_ONLINE = 8
+    COL_ONLINE_SCORE = 9
+    COL_SOURCE = 10
+    COL_PAGE = 11
 
     def icon(self) -> QIcon:
         return QIcon(str(Path(__file__).resolve().parent / "icons" / "ll_check_all.svg"))
@@ -3412,6 +3685,66 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         self._show_results(rows)
 
+    def _load_all_fetch_table_widths(self) -> list[int]:
+        config = self._load_voice_config()
+        widths = config.get("allFetchedDownloadsColumnWidths") or []
+        if not isinstance(widths, list):
+            return []
+
+        result = []
+        for value in widths:
+            try:
+                result.append(int(value))
+            except (TypeError, ValueError):
+                pass
+        return result
+
+
+    def _save_all_fetch_table_widths(self, table: QTableWidget) -> None:
+        config = self._load_voice_config()
+        config["allFetchedDownloadsColumnWidths"] = [
+            table.columnWidth(column)
+            for column in range(table.columnCount())
+        ]
+        self._save_voice_config(config)
+
+
+    def _restore_all_fetch_table_widths(self, table: QTableWidget) -> None:
+        widths = self._load_all_fetch_table_widths()
+        if not widths:
+            return
+
+        for column, width in enumerate(widths):
+            if column >= table.columnCount():
+                break
+            if width > 20:
+                table.setColumnWidth(column, width)
+
+    def _load_all_fetch_splitter_sizes(self) -> list[int]:
+        config = self._load_voice_config()
+        sizes = config.get("allFetchedDownloadsSplitterSizes") or []
+        if not isinstance(sizes, list):
+            return []
+
+        result = []
+        for value in sizes:
+            try:
+                result.append(int(value))
+            except (TypeError, ValueError):
+                pass
+        return result
+
+    def _save_all_fetch_splitter_sizes(self, splitter: QSplitter) -> None:
+        config = self._load_voice_config()
+        config["allFetchedDownloadsSplitterSizes"] = [int(value) for value in splitter.sizes()]
+        self._save_voice_config(config)
+
+
+    def _restore_all_fetch_splitter_sizes(self, splitter: QSplitter) -> None:
+        sizes = self._load_all_fetch_splitter_sizes()
+        if len(sizes) >= 2:
+            splitter.setSizes(sizes[:2])
+
     def _voice_config_path(self) -> Path:
         if self._organizer:
             path = Path(str(self._organizer.pluginDataPath())) / "ll_integration"
@@ -3425,11 +3758,16 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             return {
                 "version": 1,
                 "voiceSourceUrls": [],
+                "nexusApiKey": "",
                 "falseMatches": [],
                 "ignoredBaseMods": [],
                 "manualVoiceMatches": {},
                 "forcedVoiceMods": [],
                 "forcedBaseMods": [],
+                "completeVoiceSlots": [],
+                "noneVoiceSlots": [],
+                "localMatchThreshold": DEFAULT_VOICE_MATCH_THRESHOLD,
+                "window": {},
             }
 
         try:
@@ -3443,12 +3781,23 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         return {
             "version": 1,
             "voiceSourceUrls": list(data.get("voiceSourceUrls") or []),
+            "nexusApiKey": str(data.get("nexusApiKey") or ""),
             "falseMatches": list(data.get("falseMatches") or []),
             "ignoredBaseMods": list(data.get("ignoredBaseMods") or []),
             "manualVoiceMatches": dict(data.get("manualVoiceMatches") or {}),
             "forcedVoiceMods": list(data.get("forcedVoiceMods") or []),
             "forcedBaseMods": list(data.get("forcedBaseMods") or []),
+            "completeVoiceSlots": list(data.get("completeVoiceSlots") or []),
+            "noneVoiceSlots": list(data.get("noneVoiceSlots") or []),
+            "localMatchThreshold": self._local_match_threshold(data),
+            "window": dict(data.get("window") or {}),
         }
+
+    def _local_match_threshold(self, config: dict | None) -> int:
+        try:
+            return max(0, min(100, int((config or {}).get("localMatchThreshold") or DEFAULT_VOICE_MATCH_THRESHOLD)))
+        except (TypeError, ValueError):
+            return DEFAULT_VOICE_MATCH_THRESHOLD
 
     def _save_voice_config(self, config: dict) -> None:
         path = self._voice_config_path()
@@ -3491,82 +3840,171 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         ]
 
         rows = []
+        threshold = self._local_match_threshold(config)
+        complete_slots = {str(value).lower() for value in config.get("completeVoiceSlots", [])}
+        none_slots = {str(value).lower() for value in config.get("noneVoiceSlots", [])}
         for base in base_mods:
-            voice_candidates = self._installed_voice_candidates(base, installed_voice_mods, config)
-            manual_voice = self._manual_voice_candidate(config, base, all_mods)
-            if manual_voice:
-                voice_candidates = [
-                    manual_voice,
-                    *[
-                        candidate
-                        for candidate in voice_candidates
-                        if str(candidate.get("internal_name") or "").lower()
-                        != str(manual_voice.get("internal_name") or "").lower()
-                    ],
-                ]
-            best_voice = next(
-                (
-                    candidate
-                    for candidate in voice_candidates
-                    if candidate.get("manual") or int(candidate.get("score") or 0) > 0
-                ),
-                None,
-            ) or {
-                "display_name": "",
-                "internal_name": "",
-                "score": 0,
-                "mod_path": "",
-                "manual": False,
-            }
             page_url = self._ll_page_url(base["ll_metadata"])
             ignored = self._base_key(base) in {str(value).lower() for value in config.get("ignoredBaseMods", [])}
 
-            if ignored:
-                status = "Ignored"
-            elif best_voice.get("manual") or best_voice["score"] >= 90:
-                status = "Installed"
-            elif best_voice["score"] >= 55:
-                status = "Possible"
-            else:
-                status = "Missing"
+            for category, category_label in VOICE_CATEGORIES:
+                slot_key = self._slot_key(base, category)
+                voice_candidates = self._installed_voice_candidates(base, installed_voice_mods, config, category)
+                manual_voice = self._manual_voice_candidate(config, base, all_mods, category)
+                if manual_voice:
+                    voice_candidates = [
+                        manual_voice,
+                        *[
+                            candidate
+                            for candidate in voice_candidates
+                            if str(candidate.get("internal_name") or "").lower()
+                            != str(manual_voice.get("internal_name") or "").lower()
+                        ],
+                    ]
+                best_voice = next(
+                    (
+                        candidate
+                        for candidate in voice_candidates
+                        if candidate.get("manual") or int(candidate.get("score") or 0) >= threshold
+                    ),
+                    None,
+                ) or {
+                    "display_name": "",
+                    "internal_name": "",
+                    "score": 0,
+                    "mod_path": "",
+                    "manual": False,
+                }
 
-            rows.append({
-                "status": status,
-                "base_mod": base["display_name"],
-                "base_internal_name": base["internal_name"],
-                "classification_override": base.get("classification_override") or "auto",
-                "base_page_url": page_url,
-                "installed_voice": best_voice["display_name"],
-                "installed_voice_internal_name": best_voice["internal_name"],
-                "score": best_voice["score"],
-                "manual_voice": bool(best_voice.get("manual")),
-                "installed_voice_candidates": voice_candidates,
-                "online_candidate": "",
-                "online_download_url": "",
-                "online_source_url": "",
-                "online_score": 0,
-                "online_size": "",
-                "online_date_iso": "",
-                "online_version": "",
-                "online_candidates": [],
-                "search_query": voice_search_query(base["display_name"]),
-            })
+                slot_status = self._voice_row_status(
+                        bool(ignored),
+                        slot_key in complete_slots,
+                        slot_key in none_slots,
+                        bool(best_voice.get("manual")),
+                        int(best_voice.get("score") or 0),
+                        False,
+                        threshold,
+                    )
 
+                rows.append({
+                    "status": slot_status,
+                    "slot_status": slot_status,
+                    "base_mod": base["display_name"],
+                    "base_internal_name": base["internal_name"],
+                    "voice_category": category,
+                    "voice_category_label": category_label,
+                    "slot_key": slot_key,
+                    "classification_override": base.get("classification_override") or "auto",
+                    "base_page_url": page_url,
+                    "installed_voice": best_voice["display_name"],
+                    "installed_voice_internal_name": best_voice["internal_name"],
+                    "score": best_voice["score"],
+                    "manual_voice": bool(best_voice.get("manual")),
+                    "complete_voice": slot_key in complete_slots,
+                    "none_voice": slot_key in none_slots,
+                    "local_match_threshold": threshold,
+                    "installed_voice_candidates": voice_candidates,
+                    "online_candidate": "",
+                    "online_download_url": "",
+                    "online_source_url": "",
+                    "online_score": 0,
+                    "online_size": "",
+                    "online_date_iso": "",
+                    "online_version": "",
+                    "online_candidates": [],
+                    "search_query": f"{voice_search_query(base['display_name'])} {category_label}",
+                })
+
+        self._attach_voice_overview(rows)
+
+        category_order = {category: index for index, (category, _label) in enumerate(VOICE_CATEGORIES)}
         rows.sort(key=lambda row: (
-            {"Missing": 0, "Online found": 1, "Possible": 2, "Installed": 3, "Ignored": 4}.get(row["status"], 9),
             row["base_mod"].lower(),
+            category_order.get(str(row.get("voice_category") or ""), 99),
+            {"Missing": 0, "Online found": 1, "Possible": 2, "Installed": 3, "Complete": 4, "None": 5, "Ignored": 6}.get(row.get("slot_status") or row["status"], 9),
         ))
         return rows
+
+    def _attach_voice_overview(self, rows: list[dict]) -> None:
+        by_base: dict[str, dict[str, dict]] = {}
+        for row in rows:
+            by_base.setdefault(str(row.get("base_internal_name") or row.get("base_mod") or ""), {})[
+                str(row.get("voice_category") or "")
+            ] = row
+
+        for row in rows:
+            siblings = by_base.get(str(row.get("base_internal_name") or row.get("base_mod") or ""), {})
+            primary = self._primary_voice_row(siblings)
+            row["voice_overview"] = {
+                category: self._voice_overview_text(siblings.get(category))
+                for category, _label in VOICE_CATEGORIES
+            }
+            row["status"] = self._aggregate_voice_status(list(siblings.values()))
+            row["_overview_duplicate"] = row is not primary
+
+    def _primary_voice_row(self, siblings: dict[str, dict]) -> dict | None:
+        for category, _label in VOICE_CATEGORIES:
+            row = siblings.get(category)
+            if row:
+                return row
+        return next(iter(siblings.values()), None)
+
+    def _aggregate_voice_status(self, rows: list[dict]) -> str:
+        statuses = [str(row.get("slot_status") or row.get("status") or "") for row in rows]
+        if statuses and all(status == "Ignored" for status in statuses):
+            return "Ignored"
+        if any(
+            status == "Installed"
+            or (status == "Complete" and str(row.get("installed_voice") or "").strip())
+            for status, row in zip(statuses, rows)
+        ):
+            return "Installed"
+        if any(status in ("Possible", "Online found") for status in statuses):
+            return "Possible"
+        if statuses and all(status in ("Complete", "None", "Ignored") for status in statuses):
+            return "Complete"
+        if any(status == "Missing" for status in statuses):
+            return "Missing"
+        if any(status == "Complete" for status in statuses):
+            return "Complete"
+        if any(status == "None" for status in statuses):
+            return "None"
+        return "Missing"
+
+    def _voice_overview_text(self, row: dict | None) -> str:
+        if not row:
+            return ""
+        status = str(row.get("slot_status") or row.get("status") or "")
+        candidate = str(row.get("installed_voice") or "").strip()
+        if status == "Complete" and candidate:
+            return f"OK: {candidate}"
+        if status in ("Missing", "Ignored", "Complete", "None"):
+            return status
+        if status == "Online found":
+            online_candidate = str(row.get("online_candidate") or "").strip()
+            return f"Online: {online_candidate}" if online_candidate else "Online found"
+        if candidate:
+            prefix = "Manual" if row.get("manual_voice") else status
+            return f"{prefix}: {candidate}"
+        return status
 
     def _base_key(self, base: dict) -> str:
         return str(base.get("internal_name") or base.get("base_internal_name") or base.get("display_name") or base.get("base_mod") or "").lower()
 
-    def _manual_voice_candidate(self, config: dict, base: dict, all_mods: list[dict]) -> dict | None:
+    def _slot_key(self, base: dict, category: str) -> str:
+        return f"{self._base_key(base)}|{category}"
+
+    def _manual_match_key(self, base: dict, category: str) -> str:
+        return self._slot_key(base, category)
+
+    def _manual_voice_candidate(self, config: dict, base: dict, all_mods: list[dict], category: str) -> dict | None:
         matches = config.get("manualVoiceMatches")
         if not isinstance(matches, dict):
             return None
 
-        entry = matches.get(self._base_key(base))
+        entry = matches.get(self._manual_match_key(base, category))
+        if not isinstance(entry, dict) and category == "player":
+            entry = matches.get(self._base_key(base))
         if not isinstance(entry, dict):
             return None
 
@@ -3585,6 +4023,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
                 "mod_path": str(mod_root_path(mod["mod"])),
                 "score": 1000,
                 "manual": True,
+                "voice_category": category,
             }
 
         return {
@@ -3593,22 +4032,31 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             "mod_path": entry.get("mod_path") or "",
             "score": 1000,
             "manual": True,
+            "voice_category": category,
         }
 
-    def _installed_voice_candidates(self, base: dict, voice_mods: list[dict], config: dict) -> list[dict]:
+    def _installed_voice_candidates(self, base: dict, voice_mods: list[dict], config: dict, category: str) -> list[dict]:
         candidates = []
         for voice in voice_mods:
             if voice["internal_name"] == base["internal_name"]:
                 continue
-            if self._is_false_match(config, base, voice["display_name"], ""):
+            if self._is_false_match(config, base, voice["display_name"], "", category):
                 continue
 
             score = voice_match_score(base["display_name"], voice["display_name"])
+            guessed_category = voice_category_guess(voice["display_name"])
+            if guessed_category == category:
+                score += 20
+            elif guessed_category:
+                score = 0
+            else:
+                score = max(0, score - 35)
             candidates.append({
                 "display_name": voice["display_name"],
                 "internal_name": voice["internal_name"],
                 "mod_path": str(mod_root_path(voice["mod"])),
                 "score": score,
+                "voice_category": guessed_category,
             })
 
         return sorted(
@@ -3616,18 +4064,54 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             key=lambda item: (-int(item.get("score") or 0), str(item.get("display_name") or "").lower()),
         )
 
-    def _is_false_match(self, config: dict, base: dict, candidate: str, source_url: str) -> bool:
+    def _is_false_match(
+        self,
+        config: dict,
+        base: dict,
+        candidate: str,
+        source_url: str,
+        voice_category: str = "",
+    ) -> bool:
         base_key = self._base_key(base)
+        category_key = str(voice_category or base.get("voice_category") or "").lower()
         candidate_key = str(candidate or "").lower()
         source_key = str(source_url or "").lower()
         for item in config.get("falseMatches", []):
             if str(item.get("base") or "").lower() != base_key:
+                continue
+            item_category = str(item.get("voice_category") or "").lower()
+            if item_category and category_key and item_category != category_key:
                 continue
             if str(item.get("candidate") or "").lower() != candidate_key:
                 continue
             if str(item.get("source_url") or "").lower() in ("", source_key):
                 return True
         return False
+
+    def _voice_row_status(
+        self,
+        ignored: bool,
+        complete: bool,
+        none: bool,
+        manual: bool,
+        score: int,
+        has_online: bool,
+        threshold: int | None = None,
+    ) -> str:
+        threshold_value = threshold if threshold is not None else DEFAULT_VOICE_MATCH_THRESHOLD
+        if ignored:
+            return "Ignored"
+        if none:
+            return "None"
+        if complete:
+            return "Complete"
+        if manual or score >= 90:
+            return "Installed"
+        if score >= threshold_value:
+            return "Possible"
+        if has_online:
+            return "Online found"
+        return "Missing"
 
     def _ll_page_url(self, ini_path: Path | None) -> str:
         if ini_path is None:
@@ -3643,14 +4127,23 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
     def _show_results(self, rows: list[dict]) -> None:
         dialog = QDialog(self._parentWidget())
         dialog.setWindowTitle("LL Integration - Voice Finder")
-        dialog.resize(1180, 620)
+        dialog.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        window_config = self._voice_window_config()
+        dialog.resize(
+            int(window_config.get("width") or 1180),
+            int(window_config.get("height") or 620),
+        )
         dialog.setMinimumSize(980, 480)
 
         table = QTableWidget(dialog)
-        table.setColumnCount(8)
+        table.setColumnCount(12)
         table.setHorizontalHeaderLabels([
             "Status",
-            "Base LoversLab mod",
+            "Base mod",
+            "Voice Pack",
+            "DBVO",
+            "IVDT",
+            "Voice type",
             "Installed voice candidate",
             "Score",
             "Online candidate",
@@ -3659,17 +4152,28 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             "LL page",
         ])
         table.setRowCount(len(rows))
+        display_rows = self._build_voice_display_rows(rows)
+
+        table.setRowCount(len(display_rows))
         table._ll_voice_rows = rows
+        table._ll_voice_display_rows = display_rows
+        table._ll_voice_sort_column = -1
+        table._ll_voice_sort_ascending = True
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setAlternatingRowColors(True)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
-        for row_index, row in enumerate(rows):
-            self._fill_table_row(table, row_index, row)
+        for row_index, display_row in enumerate(display_rows):
+            self._fill_display_table_row(table, row_index, display_row)
 
         header = table.horizontalHeader()
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.COL_BASE_MOD, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_VOICEPACK, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_DBVO, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_IVDT, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_CATEGORY, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.COL_INSTALLED_VOICE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.COL_SCORE, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.COL_ONLINE, QHeaderView.ResizeMode.Stretch)
@@ -3684,6 +4188,8 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             "Online found",
             "Possible",
             "Installed",
+            "Complete",
+            "None",
             "Ignored",
         ])
 
@@ -3694,21 +4200,45 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         count_label = QLabel(dialog)
         selected_label = QLabel("Selected: none")
         selected_label.setWordWrap(True)
+        threshold_spin = QSpinBox(dialog)
+        threshold_spin.setRange(0, 100)
+        threshold_spin.setValue(self._local_match_threshold(self._load_voice_config()))
+        threshold_spin.setToolTip("Minimum local score required before an installed voice candidate is shown as a match.")
 
         open_page = QPushButton("Open LL page")
         source_urls = QPushButton("Voice source URLs")
+        nexus_link = QPushButton("Handle Nexus Link")
         fetch_sources = QPushButton("Fetch sources")
         download_candidate = QPushButton("Choose / Download")
-        all_downloads = QPushButton("All downloads")
+        all_downloads = QPushButton("Show All Source Downloads")
         false_match = QPushButton("False local match")
         manage_false_matches = QPushButton("False matches")
+        complete_slot = QPushButton("Complete / Reopen")
         ignore_mod = QPushButton("Ignore / Unignore")
         classify_mod = QPushButton("Classify")
         voice_mods = QPushButton("Voice mods")
         search_web = QPushButton("Web search")
         close = QPushButton("Close")
         progress_label = QLabel("Ready")
+        all_downloads.setMinimumHeight(32)
+        all_downloads.setStyleSheet(
+            "QPushButton { background-color: #214d7a; color: white; font-weight: 700; padding: 6px 14px; }"
+            "QPushButton:hover { background-color: #2c669f; }"
+            "QPushButton:disabled { background-color: #3a3a3a; color: #aaa; }"
+        )
+        download_candidate.setStyleSheet(
+            "QPushButton { background-color: #1f6f46; color: white; font-weight: 700; }"
+            "QPushButton:hover { background-color: #278a58; }"
+        )
+        fetch_sources.setStyleSheet(
+            "QPushButton { background-color: #6a4d1c; color: white; font-weight: 700; }"
+            "QPushButton:hover { background-color: #856124; }"
+        )
 
+        header.sectionClicked.connect(lambda column: self._sort_voice_table(table, column, filter_mode, filter_text, count_label))
+        table.customContextMenuRequested.connect(
+            lambda pos: self._show_voice_context_menu(table, pos, filter_mode, filter_text, count_label)
+        )
         table.itemSelectionChanged.connect(lambda: self._update_selected_label(table, selected_label))
         table.itemDoubleClicked.connect(lambda item: self._inspect_double_clicked_cell(table, item))
         filter_mode.currentTextChanged.connect(
@@ -3719,6 +4249,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         )
         open_page.clicked.connect(lambda _checked=False: self._open_selected_page(table))
         source_urls.clicked.connect(lambda _checked=False: self._edit_source_urls(dialog))
+        nexus_link.clicked.connect(lambda _checked=False: self._handle_nexus_link(dialog))
         fetch_sources.clicked.connect(
             lambda _checked=False: self._fetch_sources(
                 dialog,
@@ -3741,6 +4272,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         all_downloads.clicked.connect(lambda _checked=False: self._show_all_fetched_downloads(dialog, table, progress_label, download_candidate, fetch_sources))
         false_match.clicked.connect(lambda _checked=False: self._mark_false_match(table, filter_mode, filter_text, count_label))
         manage_false_matches.clicked.connect(lambda _checked=False: self._manage_false_matches(table, filter_mode, filter_text, count_label))
+        complete_slot.clicked.connect(lambda _checked=False: self._toggle_complete_slot(table, filter_mode, filter_text, count_label))
         ignore_mod.clicked.connect(lambda _checked=False: self._toggle_ignore(table, filter_mode, filter_text, count_label))
         classify_mod.clicked.connect(lambda _checked=False: self._classify_selected_mod(table, filter_mode, filter_text, count_label))
         voice_mods.clicked.connect(lambda _checked=False: self._show_voice_mods_inventory(dialog))
@@ -3751,20 +4283,38 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         controls.addWidget(QLabel("Filter"))
         controls.addWidget(filter_mode)
         controls.addWidget(filter_text, 1)
+        controls.addWidget(QLabel("Local score"))
+        controls.addWidget(threshold_spin)
         controls.addWidget(count_label)
+        threshold_spin.valueChanged.connect(
+            lambda value: self._set_local_match_threshold(
+                table,
+                value,
+                filter_mode,
+                filter_text,
+                count_label,
+                summary,
+            )
+        )
+
+        false_match.hide()
+        complete_slot.hide()
+        ignore_mod.hide()
+        classify_mod.hide()
 
         source_buttons = QHBoxLayout()
         source_buttons.addWidget(source_urls)
+        source_buttons.addWidget(nexus_link)
         source_buttons.addWidget(fetch_sources)
-        source_buttons.addStretch(1)
+        source_buttons.addWidget(all_downloads, 1)
 
         row_buttons = QHBoxLayout()
         row_buttons.addWidget(download_candidate)
-        row_buttons.addWidget(all_downloads)
         row_buttons.addWidget(open_page)
         row_buttons.addWidget(search_web)
         row_buttons.addWidget(false_match)
         row_buttons.addWidget(manage_false_matches)
+        row_buttons.addWidget(complete_slot)
         row_buttons.addWidget(ignore_mod)
         row_buttons.addWidget(classify_mod)
         row_buttons.addWidget(voice_mods)
@@ -3785,11 +4335,167 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         dialog.setLayout(layout)
 
         self._apply_filter(table, filter_mode, filter_text, count_label)
+        dialog.finished.connect(lambda _result: self._save_voice_window_config(dialog))
+        if bool(window_config.get("maximized", True)):
+            dialog.showMaximized()
         dialog.exec()
+
+    def _build_voice_display_rows(self, rows: list[dict]) -> list[dict]:
+        grouped: dict[str, dict] = {}
+
+        for row in rows:
+            base_key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
+            if not base_key:
+                continue
+
+            if base_key not in grouped:
+                grouped[base_key] = {
+                    "base_mod": row.get("base_mod") or "",
+                    "base_internal_name": row.get("base_internal_name") or "",
+                    "base_page_url": row.get("base_page_url") or "",
+                    "classification_override": row.get("classification_override") or "auto",
+                    "slots": {},
+                }
+
+            category = str(row.get("voice_category") or "")
+            grouped[base_key]["slots"][category] = row
+
+        display_rows = list(grouped.values())
+
+        for display_row in display_rows:
+            slot_rows = list((display_row.get("slots") or {}).values())
+            display_row["status"] = self._aggregate_voice_status(slot_rows)
+            display_row["installed_voice"] = self._best_display_candidate(slot_rows)
+            display_row["score"] = self._best_display_score(slot_rows)
+            display_row["online_candidate"] = self._best_display_online_candidate(slot_rows)
+            display_row["online_score"] = self._best_display_online_score(slot_rows)
+
+        return display_rows
+
+
+    def _best_display_candidate(self, rows: list[dict]) -> str:
+        candidates = [
+            str(row.get("installed_voice") or "").strip()
+            for row in rows
+            if str(row.get("installed_voice") or "").strip()
+        ]
+        return " | ".join(candidates[:3])
+
+
+    def _best_display_score(self, rows: list[dict]) -> int:
+        scores = []
+        for row in rows:
+            try:
+                scores.append(int(row.get("score") or 0))
+            except (TypeError, ValueError):
+                pass
+        return max(scores) if scores else 0
+
+
+    def _best_display_online_candidate(self, rows: list[dict]) -> str:
+        candidates = [
+            str(row.get("online_candidate") or "").strip()
+            for row in rows
+            if str(row.get("online_candidate") or "").strip()
+        ]
+        return " | ".join(candidates[:3])
+
+
+    def _best_display_online_score(self, rows: list[dict]) -> int:
+        scores = []
+        for row in rows:
+            try:
+                scores.append(int(row.get("online_score") or 0))
+            except (TypeError, ValueError):
+                pass
+        return max(scores) if scores else 0
+
+
+    def _fill_display_table_row(self, table: QTableWidget, row_index: int, display_row: dict) -> None:
+        slots = display_row.get("slots") or {}
+
+        voicepack = slots.get("npc")
+        dbvo = slots.get("player")
+        ivdt = slots.get("scene")
+
+        self._set_item(table, row_index, self.COL_STATUS, display_row.get("status", ""))
+        self._set_item(table, row_index, self.COL_BASE_MOD, display_row.get("base_mod", ""))
+        self._set_item(table, row_index, self.COL_VOICEPACK, self._voice_overview_text(voicepack) or "Missing")
+        self._set_item(table, row_index, self.COL_DBVO, self._voice_overview_text(dbvo) or "Missing")
+        self._set_item(table, row_index, self.COL_IVDT, self._voice_overview_text(ivdt) or "Missing")
+        self._set_item(table, row_index, self.COL_CATEGORY, "")
+        self._set_item(table, row_index, self.COL_INSTALLED_VOICE, display_row.get("installed_voice", ""))
+        self._set_item(table, row_index, self.COL_SCORE, str(display_row.get("score") or ""))
+        self._set_item(table, row_index, self.COL_ONLINE, display_row.get("online_candidate", ""))
+        self._set_item(table, row_index, self.COL_ONLINE_SCORE, str(display_row.get("online_score") or ""))
+        self._set_item(table, row_index, self.COL_SOURCE, "")
+        self._set_item(table, row_index, self.COL_PAGE, display_row.get("base_page_url", ""))
+
+        self._apply_display_row_background(table, row_index, display_row)
+
+
+    def _apply_display_row_background(self, table: QTableWidget, row_index: int, display_row: dict) -> None:
+        color = self._voice_row_background_color(display_row)
+
+        for column in range(table.columnCount()):
+            item = table.item(row_index, column)
+            if item is None:
+                continue
+
+            if column in (self.COL_VOICEPACK, self.COL_DBVO, self.COL_IVDT):
+                item.setBackground(self._overview_background_color(item.text()))
+            else:
+                item.setBackground(color)
+
+            item.setForeground(QColor(242, 242, 242))
+
+
+    def _refresh_display_rows(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox | None = None,
+        filter_text: QLineEdit | None = None,
+        count_label: QLabel | None = None,
+    ) -> None:
+        rows = getattr(table, "_ll_voice_rows", [])
+        display_rows = self._build_voice_display_rows(rows)
+
+        table._ll_voice_display_rows = display_rows
+        table.setRowCount(len(display_rows))
+
+        table.setUpdatesEnabled(False)
+        try:
+            for row_index, display_row in enumerate(display_rows):
+                self._fill_display_table_row(table, row_index, display_row)
+        finally:
+            table.setUpdatesEnabled(True)
+
+        if filter_mode is not None and filter_text is not None and count_label is not None:
+            self._apply_filter(table, filter_mode, filter_text, count_label)
+
+    def _voice_window_config(self) -> dict:
+        config = self._load_voice_config()
+        window = config.get("window")
+        return window if isinstance(window, dict) else {}
+
+    def _save_voice_window_config(self, dialog: QDialog) -> None:
+        config = self._load_voice_config()
+        size = dialog.normalGeometry().size() if dialog.isMaximized() else dialog.size()
+        config["window"] = {
+            "width": max(980, int(size.width())),
+            "height": max(480, int(size.height())),
+            "maximized": bool(dialog.isMaximized()),
+        }
+        self._save_voice_config(config)
 
     def _fill_table_row(self, table: QTableWidget, row_index: int, row: dict) -> None:
         self._set_item(table, row_index, self.COL_STATUS, row.get("status", ""))
         self._set_item(table, row_index, self.COL_BASE_MOD, row.get("base_mod", ""))
+        overview = row.get("voice_overview") or {}
+        self._set_item(table, row_index, self.COL_VOICEPACK, overview.get("npc", ""))
+        self._set_item(table, row_index, self.COL_DBVO, overview.get("player", ""))
+        self._set_item(table, row_index, self.COL_IVDT, overview.get("scene", ""))
+        self._set_item(table, row_index, self.COL_CATEGORY, row.get("voice_category_label", ""))
         self._set_item(table, row_index, self.COL_INSTALLED_VOICE, row.get("installed_voice", ""))
         self._set_item(table, row_index, self.COL_SCORE, "Manual" if row.get("manual_voice") else str(row.get("score") or ""))
         self._set_item(table, row_index, self.COL_ONLINE, row.get("online_candidate", ""))
@@ -3807,25 +4513,38 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         candidate = row.get("online_candidate") or row.get("installed_voice") or "no candidate"
         label.setText(
             f"Selected: {row.get('base_mod') or ''} | "
-            f"{row.get('status') or ''} | {candidate}"
+            f"{row.get('voice_category_label') or ''} | "
+            f"{row.get('slot_status') or row.get('status') or ''} | {candidate}"
         )
 
     def _set_item(self, table: QTableWidget, row: int, column: int, value: str) -> None:
         item = QTableWidgetItem(str(value or ""))
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        item.setData(Qt.ItemDataRole.UserRole, row)
+        full_text = str(value or "")
+        if full_text:
+            item.setToolTip(full_text)
 
         if column == self.COL_STATUS:
             status = str(value or "")
             if status == "Missing":
-                item.setToolTip("No installed voice-like mod matched this LL mod.")
+                item.setToolTip("Missing: no installed voice-like mod matched this slot.")
             elif status == "Possible":
-                item.setToolTip("A possible voice pack was found, but the score is not high enough to trust automatically.")
+                item.setToolTip("Possible: a candidate was found, but the score is not high enough to fully trust.")
             elif status == "Installed":
-                item.setToolTip("A likely installed voice pack was found.")
+                item.setToolTip("Installed: a likely installed voice pack was found.")
+            elif status == "Complete":
+                item.setToolTip("This voice slot is marked as done and will stay out of the missing queue.")
+            elif status == "None":
+                item.setToolTip("None: this voice slot is intentionally marked as not existing for this mod.")
+        elif column in (self.COL_VOICEPACK, self.COL_DBVO, self.COL_IVDT):
+            item.setToolTip(str(value or "Missing"))
+        elif column == self.COL_CATEGORY:
+            item.setToolTip("Voice slot: Voicepack for NPC/dialogue voices, DBVO/DVO for player voice, or IVDT/IVDT/DVIT for scene/addon voices.")
         elif column == self.COL_INSTALLED_VOICE:
-            item.setToolTip("Double-click to inspect all installed voice candidates.")
+            item.setToolTip(f"{full_text}\n\nDouble-click to inspect all installed voice candidates.".strip())
         elif column == self.COL_ONLINE:
-            item.setToolTip("Use Choose / Download to inspect all online candidates.")
+            item.setToolTip(f"{full_text}\n\nUse Choose / Download to inspect all online candidates.".strip())
 
         table.setItem(row, column, item)
 
@@ -3835,8 +4554,29 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             item = table.item(row_index, column)
             if item is None:
                 continue
-            item.setBackground(color)
+            if column in (self.COL_VOICEPACK, self.COL_DBVO, self.COL_IVDT):
+                item.setBackground(self._overview_background_color(item.text()))
+            else:
+                item.setBackground(color)
             item.setForeground(QColor(242, 242, 242))
+
+    def _overview_background_color(self, value: str) -> QColor:
+        text = str(value or "").lower()
+        if text.startswith("manual") or text.startswith("installed") or text.startswith("ok"):
+            return QColor(34, 78, 52)
+        if text.startswith("possible"):
+            return QColor(88, 70, 30)
+        if text.startswith("online"):
+            return QColor(34, 58, 86)
+        if text == "complete":
+            return QColor(34, 68, 88)
+        if text == "none":
+            return QColor(58, 58, 68)
+        if text == "ignored":
+            return QColor(54, 54, 54)
+        if text == "missing":
+            return QColor(78, 42, 42)
+        return QColor(38, 42, 46)
 
     def _voice_row_background_color(self, row: dict) -> QColor:
         status = str(row.get("status") or "")
@@ -3845,6 +4585,10 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         if row.get("manual_voice"):
             return QColor(34, 88, 62)
+        if status == "Complete":
+            return QColor(34, 68, 88)
+        if status == "None":
+            return QColor(58, 58, 68)
         if status == "Installed" or score >= 90:
             return QColor(34, 78, 52)
         if status == "Possible" or score >= 55:
@@ -3883,12 +4627,23 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         online = sum(1 for row in rows if row["status"] == "Online found")
         possible = sum(1 for row in rows if row["status"] == "Possible")
         installed = sum(1 for row in rows if row["status"] == "Installed")
+        complete = sum(1 for row in rows if row["status"] == "Complete")
+        none = sum(1 for row in rows if row["status"] == "None")
         ignored = sum(1 for row in rows if row["status"] == "Ignored")
+        missing_by_type = []
+        for category, label in VOICE_CATEGORIES:
+            count = sum(
+                1
+                for row in rows
+                if row.get("voice_category") == category and (row.get("slot_status") or row.get("status")) in ("Missing", "Online found")
+            )
+            missing_by_type.append(f"{label}: {count}")
 
         return (
             f"Scanned {total} LoversLab base mods. "
             f"Missing: {missing}. Online found: {online}. Possible: {possible}. "
-            f"Installed: {installed}. Ignored: {ignored}. "
+            f"Installed: {installed}. Complete: {complete}. None: {none}. Ignored: {ignored}. "
+            f"Needs check by type: {', '.join(missing_by_type)}. "
             "Add voice source URLs, fetch them, then download selected candidates into MO2 downloads."
         )
 
@@ -3903,22 +4658,40 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         needle = filter_text.text().strip().lower()
         visible = 0
 
-        for row_index, row in enumerate(getattr(table, "_ll_voice_rows", [])):
-            show = True
+        display_rows = getattr(table, "_ll_voice_display_rows", [])
 
-            if mode != "All" and row["status"] != mode:
-                show = False
+        for row_index, display_row in enumerate(display_rows):
+            show = True
+            status = str(display_row.get("status") or "")
+
+            if mode != "All" and status != mode:
+                slots = display_row.get("slots") or {}
+                if not any(str(slot.get("slot_status") or slot.get("status") or "") == mode for slot in slots.values()):
+                    show = False
 
             if needle:
-                haystack = " ".join([
-                    row.get("status", ""),
-                    row.get("base_mod", ""),
-                    row.get("installed_voice", ""),
-                    row.get("online_candidate", ""),
-                    row.get("online_source_url", ""),
-                    row.get("search_query", ""),
-                    row.get("base_page_url", ""),
-                ]).lower()
+                slots = display_row.get("slots") or {}
+                haystack_parts = [
+                    status,
+                    display_row.get("base_mod", ""),
+                    display_row.get("base_page_url", ""),
+                    display_row.get("installed_voice", ""),
+                    display_row.get("online_candidate", ""),
+                ]
+
+                for slot in slots.values():
+                    haystack_parts.extend([
+                        slot.get("slot_status", ""),
+                        slot.get("status", ""),
+                        slot.get("voice_category", ""),
+                        slot.get("voice_category_label", ""),
+                        slot.get("installed_voice", ""),
+                        slot.get("online_candidate", ""),
+                        slot.get("online_source_url", ""),
+                        slot.get("search_query", ""),
+                    ])
+
+                haystack = " ".join(str(value or "") for value in haystack_parts).lower()
                 if needle not in haystack:
                     show = False
 
@@ -3928,17 +4701,357 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         count_label.setText(f"{visible} / {table.rowCount()}")
 
+    def _sort_voice_table(
+        self,
+        table: QTableWidget,
+        column: int,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        rows = getattr(table, "_ll_voice_rows", [])
+        selected = self._selected_row(table)
+        selected_key = (
+            str(selected.get("base_internal_name") or selected.get("base_mod") or ""),
+            str(selected.get("voice_category") or ""),
+        ) if selected else None
+
+        previous_column = int(getattr(table, "_ll_voice_sort_column", -1))
+        ascending = bool(getattr(table, "_ll_voice_sort_ascending", True))
+        if previous_column == column:
+            ascending = not ascending
+        else:
+            ascending = True
+        table._ll_voice_sort_column = column
+        table._ll_voice_sort_ascending = ascending
+
+        rows.sort(key=lambda row: self._voice_sort_key(row, column), reverse=not ascending)
+        self._refresh_voice_overviews(table)
+        if selected_key:
+            for index, row in enumerate(rows):
+                key = (
+                    str(row.get("base_internal_name") or row.get("base_mod") or ""),
+                    str(row.get("voice_category") or ""),
+                )
+                if key == selected_key:
+                    table.selectRow(index)
+                    break
+        self._apply_filter(table, filter_mode, filter_text, count_label)
+
+    def _voice_sort_key(self, row: dict, column: int) -> tuple:
+        if column == self.COL_STATUS:
+            return (self._status_sort_bucket(row.get("status")), str(row.get("base_mod") or "").lower())
+        if column == self.COL_BASE_MOD:
+            return (str(row.get("base_mod") or "").lower(), self._category_sort_index(row))
+        if column == self.COL_VOICEPACK:
+            return self._overview_sort_key(row, "npc")
+        if column == self.COL_DBVO:
+            return self._overview_sort_key(row, "player")
+        if column == self.COL_IVDT:
+            return self._overview_sort_key(row, "scene")
+        if column == self.COL_CATEGORY:
+            return (self._category_sort_index(row), str(row.get("base_mod") or "").lower())
+        if column == self.COL_INSTALLED_VOICE:
+            return (str(row.get("installed_voice") or "").lower(), str(row.get("base_mod") or "").lower())
+        if column == self.COL_SCORE:
+            return (-int(row.get("score") or 0), str(row.get("base_mod") or "").lower())
+        if column == self.COL_ONLINE:
+            return (str(row.get("online_candidate") or "").lower(), str(row.get("base_mod") or "").lower())
+        if column == self.COL_ONLINE_SCORE:
+            return (-int(row.get("online_score") or 0), str(row.get("base_mod") or "").lower())
+        if column == self.COL_SOURCE:
+            return (str(row.get("online_source_url") or "").lower(), str(row.get("base_mod") or "").lower())
+        if column == self.COL_PAGE:
+            return (str(row.get("base_page_url") or "").lower(), str(row.get("base_mod") or "").lower())
+        return (str(row.get("base_mod") or "").lower(), self._category_sort_index(row))
+
+    def _overview_sort_key(self, row: dict, category: str) -> tuple:
+        value = str((row.get("voice_overview") or {}).get(category) or "Missing")
+        return (self._status_sort_bucket(value), value.lower(), str(row.get("base_mod") or "").lower())
+
+    def _status_sort_bucket(self, value: object) -> int:
+        text = str(value or "").lower()
+        if text.startswith("complete"):
+            return 0
+        if text.startswith("none"):
+            return 0
+        if text.startswith("manual") or text.startswith("installed"):
+            return 1
+        if text.startswith("possible") or text.startswith("online"):
+            return 2
+        if text.startswith("missing"):
+            return 3
+        if text.startswith("ignored"):
+            return 4
+        return 5
+
+    def _category_sort_index(self, row: dict) -> int:
+        category_order = {category: index for index, (category, _label) in enumerate(VOICE_CATEGORIES)}
+        return category_order.get(str(row.get("voice_category") or ""), 99)
+
+    def _refresh_voice_overviews(self, table: QTableWidget) -> None:
+        self._attach_voice_overview(getattr(table, "_ll_voice_rows", []))
+        self._refresh_display_rows(table)
+
+    def _refresh_voice_base(self, table: QTableWidget, target_row: dict) -> None:
+        self._attach_voice_overview(getattr(table, "_ll_voice_rows", []))
+        self._refresh_display_rows(table)
+
+    def _set_local_match_threshold(
+        self,
+        table: QTableWidget,
+        value: int,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+        summary: QLabel,
+    ) -> None:
+        config = self._load_voice_config()
+        config["localMatchThreshold"] = int(value)
+        self._save_voice_config(config)
+
+        for row in getattr(table, "_ll_voice_rows", []):
+            row["local_match_threshold"] = int(value)
+            if (row.get("slot_status") or row.get("status")) in ("Ignored", "Complete", "None"):
+                continue
+            self._apply_local_threshold_to_row(row, int(value))
+
+        self._attach_voice_overview(getattr(table, "_ll_voice_rows", []))
+        self._refresh_display_rows(table, filter_mode, filter_text, count_label)
+        summary.setText(self._summary_text(getattr(table, "_ll_voice_rows", [])))
+
+    def _apply_local_threshold_to_row(self, row: dict, threshold: int) -> None:
+        candidates = list(row.get("installed_voice_candidates") or [])
+        best = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.get("manual") or int(candidate.get("score") or 0) >= threshold
+            ),
+            None,
+        )
+        if best:
+            row["installed_voice"] = best.get("display_name") or ""
+            row["installed_voice_internal_name"] = best.get("internal_name") or ""
+            row["score"] = int(best.get("score") or 0)
+            row["manual_voice"] = bool(best.get("manual"))
+        else:
+            row["installed_voice"] = ""
+            row["installed_voice_internal_name"] = ""
+            row["online_candidate"] = ""
+            row["online_download_url"] = ""
+            row["online_source_url"] = ""
+            row["online_score"] = 0
+            row["score"] = 0
+            row["manual_voice"] = False
+
+        row["slot_status"] = self._voice_row_status(
+            False,
+            False,
+            bool(row.get("none_voice")),
+            bool(row.get("manual_voice")),
+            int(row.get("score") or 0),
+            bool(row.get("online_candidate")),
+            threshold,
+        )
+        row["status"] = row["slot_status"]
+
     def _selected_row(self, table: QTableWidget) -> dict | None:
+        context_row = getattr(table, "_ll_context_voice_row", None)
+        if isinstance(context_row, dict):
+            table._ll_context_voice_row = None
+            return context_row
+
         selected = table.selectedItems()
         if not selected:
             return None
 
         row_index = selected[0].row()
-        rows = getattr(table, "_ll_voice_rows", [])
-        if row_index < 0 or row_index >= len(rows):
+        display_rows = getattr(table, "_ll_voice_display_rows", [])
+        if row_index < 0 or row_index >= len(display_rows):
             return None
 
-        return rows[row_index]
+        display_row = display_rows[row_index]
+        slots = display_row.get("slots") or {}
+
+        # Fallback seulement pour boutons globaux non-slot.
+        return slots.get("npc") or slots.get("player") or slots.get("scene")
+
+    def _show_voice_context_menu(
+        self,
+        table: QTableWidget,
+        pos,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        item = table.itemAt(pos)
+        if item is None:
+            return
+
+        table.setCurrentCell(item.row(), item.column())
+        slot_row = self._context_target_row(table, item.row(), item.column())
+
+        # Pas une colonne slot => pas de menu de taggage.
+        if not slot_row:
+            return
+
+        menu = QMenu(table)
+
+        title = QAction(
+            f"{slot_row.get('base_mod') or ''} | {slot_row.get('voice_category_label') or ''}",
+            menu,
+        )
+        title.setEnabled(False)
+        menu.addAction(title)
+        menu.addSeparator()
+
+        complete_action = QAction("Mark this slot complete", menu)
+        none_action = QAction("Set this slot to None / does not exist", menu)
+        reopen_action = QAction("Reopen this slot", menu)
+        inspect_action = QAction("Inspect installed candidates", menu)
+
+        complete_action.triggered.connect(
+            lambda _checked=False: self._set_slot_flag(
+                table, slot_row, "complete", filter_mode, filter_text, count_label
+            )
+        )
+        none_action.triggered.connect(
+            lambda _checked=False: self._set_slot_flag(
+                table, slot_row, "none", filter_mode, filter_text, count_label
+            )
+        )
+        reopen_action.triggered.connect(
+            lambda _checked=False: self._set_slot_flag(
+                table, slot_row, "reopen", filter_mode, filter_text, count_label
+            )
+        )
+        inspect_action.triggered.connect(
+            lambda _checked=False: self._select_row_and_inspect(table, slot_row)
+        )
+
+        menu.addAction(complete_action)
+        menu.addAction(none_action)
+        menu.addAction(reopen_action)
+        menu.addSeparator()
+        menu.addAction(inspect_action)
+
+        if str(slot_row.get("installed_voice") or "").strip():
+            false_match_action = QAction("Reject this installed candidate / false local match", menu)
+            false_match_action.triggered.connect(
+                lambda _checked=False: self._select_row_and_mark_false_match(
+                    table, slot_row, filter_mode, filter_text, count_label
+                )
+            )
+            menu.addAction(false_match_action)
+
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    def _context_target_row(self, table: QTableWidget, row_index: int, column: int) -> dict | None:
+        display_rows = getattr(table, "_ll_voice_display_rows", [])
+        if row_index < 0 or row_index >= len(display_rows):
+            return None
+
+        display_row = display_rows[row_index]
+        slots = display_row.get("slots") or {}
+
+        category = self._category_for_overview_column(column)
+        if category:
+            return slots.get(category)
+
+        return None
+
+    def _category_for_overview_column(self, column: int) -> str:
+        if column == self.COL_VOICEPACK:
+            return "npc"
+        if column == self.COL_DBVO:
+            return "player"
+        if column == self.COL_IVDT:
+            return "scene"
+        return ""
+
+    def _select_row_and_inspect(self, table: QTableWidget, row: dict) -> None:
+        self._select_voice_row(table, row)
+        self._show_installed_voice_candidates(table)
+
+    def _select_row_and_mark_false_match(
+        self,
+        table: QTableWidget,
+        row: dict,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        self._select_voice_row(table, row)
+        self._mark_false_match(table, filter_mode, filter_text, count_label)
+
+    def _select_voice_row(self, table: QTableWidget, row: dict) -> None:
+        table._ll_context_voice_row = row
+
+    def _set_slot_flag(
+        self,
+        table: QTableWidget,
+        row: dict,
+        mode: str,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        slot_key = str(row.get("slot_key") or self._slot_key(row, str(row.get("voice_category") or "player"))).lower()
+        if not slot_key:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Selected voice slot cannot be updated.")
+            return
+
+        config = self._load_voice_config()
+        complete_slots = {str(value).lower() for value in config.get("completeVoiceSlots", [])}
+        none_slots = {str(value).lower() for value in config.get("noneVoiceSlots", [])}
+        manual_matches = dict(config.get("manualVoiceMatches") or {})
+
+        if mode == "complete":
+            complete_slots.add(slot_key)
+            none_slots.discard(slot_key)
+            row["complete_voice"] = True
+            row["none_voice"] = False
+            row["slot_status"] = "Complete"
+            row["status"] = "Complete"
+        elif mode == "none":
+            confirm = QMessageBox.question(
+                self._parentWidget(),
+                PLUGIN_NAME,
+                "Mark this voice slot as None / does not exist?\n\n"
+                f"Base: {row.get('base_mod') or ''}\n"
+                f"Slot: {row.get('voice_category_label') or ''}\n\n"
+                "This hides it from the missing list until you reopen it.",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            none_slots.add(slot_key)
+            complete_slots.discard(slot_key)
+            row["complete_voice"] = False
+            row["none_voice"] = True
+            row["installed_voice"] = ""
+            row["installed_voice_internal_name"] = ""
+            row["score"] = 0
+            row["manual_voice"] = False
+            manual_matches.pop(slot_key, None)
+            row["installed_voice_candidates"] = [
+                candidate for candidate in row.get("installed_voice_candidates", []) if not candidate.get("manual")
+            ]
+            row["slot_status"] = "None"
+            row["status"] = "None"
+        else:
+            complete_slots.discard(slot_key)
+            none_slots.discard(slot_key)
+            row["complete_voice"] = False
+            row["none_voice"] = False
+            self._apply_local_threshold_to_row(row, self._local_match_threshold(config))
+
+        config["completeVoiceSlots"] = sorted(complete_slots)
+        config["noneVoiceSlots"] = sorted(none_slots)
+        config["manualVoiceMatches"] = manual_matches
+        self._save_voice_config(config)
+        self._refresh_voice_base(table, row)
+        self._apply_filter(table, filter_mode, filter_text, count_label)
 
     def _open_selected_page(self, table: QTableWidget) -> None:
         row = self._selected_row(table)
@@ -3983,8 +5096,8 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         dialog.resize(900, 500)
 
         candidate_table = QTableWidget(dialog)
-        candidate_table.setColumnCount(3)
-        candidate_table.setHorizontalHeaderLabels(["Score", "Installed voice candidate", "Folder"])
+        candidate_table.setColumnCount(4)
+        candidate_table.setHorizontalHeaderLabels(["Score", "Type", "Installed voice candidate", "Folder"])
         candidate_table.setRowCount(len(candidates))
         candidate_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         candidate_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -3994,6 +5107,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         for index, candidate in enumerate(candidates):
             for column, value in enumerate([
                 "Manual" if candidate.get("manual") else str(candidate.get("score") or ""),
+                VOICE_CATEGORY_LABELS.get(candidate.get("voice_category") or "", candidate.get("voice_category") or ""),
                 candidate.get("display_name") or "",
                 candidate.get("mod_path") or "",
             ]):
@@ -4009,11 +5123,12 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         header = candidate_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         candidate_table.selectRow(0)
 
-        title = QLabel(f"Base mod: {row.get('base_mod') or ''}")
+        title = QLabel(f"Base mod: {row.get('base_mod') or ''} | {row.get('voice_category_label') or ''}")
         title.setStyleSheet("font-weight: 700;")
         hint = QLabel("Installed candidates are sorted by score. Open a folder to inspect archive contents, or fix the selected candidate as the manual match for this base mod.")
         hint.setWordWrap(True)
@@ -4079,6 +5194,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             haystack = " ".join([
                 str(candidate.get("score") or ""),
                 "manual" if candidate.get("manual") else "",
+                VOICE_CATEGORY_LABELS.get(candidate.get("voice_category") or "", candidate.get("voice_category") or ""),
                 candidate.get("display_name") or "",
                 candidate.get("internal_name") or "",
                 candidate.get("mod_path") or "",
@@ -4113,27 +5229,30 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             return
 
         candidate = dict(candidates[candidate_index])
-        base_key = str(row.get("base_internal_name") or row.get("base_mod") or "").lower()
-        if not base_key or not candidate.get("internal_name"):
+        slot_key = str(row.get("slot_key") or self._slot_key(row, str(row.get("voice_category") or "player"))).lower()
+        if not slot_key or not candidate.get("internal_name"):
             QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "This candidate cannot be bound manually.")
             return
 
         config = self._load_voice_config()
         manual_matches = dict(config.get("manualVoiceMatches") or {})
-        manual_matches[base_key] = {
+        manual_matches[slot_key] = {
             "internal_name": candidate.get("internal_name") or "",
             "display_name": candidate.get("display_name") or "",
             "mod_path": candidate.get("mod_path") or "",
+            "voice_category": row.get("voice_category") or "",
         }
         config["manualVoiceMatches"] = manual_matches
         self._save_voice_config(config)
 
         candidate["score"] = 1000
         candidate["manual"] = True
+        candidate["voice_category"] = row.get("voice_category") or candidate.get("voice_category") or ""
         row["installed_voice"] = candidate.get("display_name") or ""
         row["installed_voice_internal_name"] = candidate.get("internal_name") or ""
         row["score"] = 1000
         row["manual_voice"] = True
+        row["slot_status"] = "Installed"
         row["status"] = "Installed"
         row["installed_voice_candidates"] = [
             candidate,
@@ -4145,11 +5264,12 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             ],
         ]
 
-        self._fill_table_row(main_table, self._selected_table_index(main_table), row)
+        self._refresh_voice_overviews(main_table)
         QMessageBox.information(
             dialog,
             PLUGIN_NAME,
-            f"Manual voice match saved:\n\n{row.get('base_mod') or ''}\n-> {candidate.get('display_name') or ''}",
+            f"Manual voice match saved:\n\n{row.get('base_mod') or ''}\n"
+            f"{row.get('voice_category_label') or ''} -> {candidate.get('display_name') or ''}",
         )
 
     def _open_selected_voice_folder(self, table: QTableWidget) -> None:
@@ -4181,11 +5301,10 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         text = QTextEdit(dialog)
         text.setPlainText("\n".join(config.get("voiceSourceUrls", [])))
-        text.setPlaceholderText("One LoversLab file URL per line")
+        text.setPlaceholderText("One LoversLab or Nexus Mods source URL per line")
 
         help_text = QLabel(
-            "Add LoversLab pages that contain DBVO/voice downloads. "
-            "The fetch step reads each page's downloads and matches individual archives against missing base mods."
+            "Add LoversLab download pages or Nexus Mods pages. Nexus URLs are normalized to their Files tab automatically."
         )
         help_text.setWordWrap(True)
 
@@ -4207,13 +5326,124 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             value = line.strip()
             if not value or value.startswith("#"):
                 continue
-            if "loverslab.com/files/file/" in value.lower():
-                value = with_query_value(value, "do", "download")
+            value = normalize_voice_source_url(value)
             if value not in urls:
                 urls.append(value)
         config["voiceSourceUrls"] = urls
         self._save_voice_config(config)
         text.setPlainText("\n".join(urls))
+
+    def _nexus_api_tutorial_image_path(self) -> Path | None:
+        here = Path(__file__).resolve()
+        candidates = [
+            here.parent / "Mo2_ImageTutorial" / "API_Explain.png",
+            here.parent.parent / "Mo2_ImageTutorial" / "API_Explain.png",
+            ROOT_DIR / "Mo2_ImageTutorial" / "API_Explain.png",
+            Path.cwd() / "Mo2_ImageTutorial" / "API_Explain.png",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _handle_nexus_link(self, parent: QDialog) -> None:
+        config = self._load_voice_config()
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Handle Nexus Link")
+        dialog.resize(760, 620)
+
+        help_text = QLabel(
+            "Paste a Nexus Mods personal API key here. It is stored only in LL Integration's local MO2 plugin config "
+            "and is used to list Nexus file downloads for source scoring."
+        )
+        help_text.setWordWrap(True)
+
+        image_label = QLabel(dialog)
+        tutorial_path = self._nexus_api_tutorial_image_path()
+        if tutorial_path is not None:
+            pixmap = QPixmap(str(tutorial_path))
+            if not pixmap.isNull():
+                image_label.setPixmap(pixmap.scaledToWidth(620, Qt.TransformationMode.SmoothTransformation))
+                image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            else:
+                image_label.setText("Nexus API key tutorial image could not be loaded.")
+        else:
+            image_label.setText("Nexus API key tutorial image not found.")
+
+        key_input = QLineEdit(dialog)
+        key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        key_input.setPlaceholderText("Nexus Mods API key")
+        key_input.setText(str(config.get("nexusApiKey") or ""))
+
+        status = QLabel("Ready")
+        status.setWordWrap(True)
+
+        def set_api_status(text: str, ready: bool) -> None:
+            color = "#0f5f36" if ready else "#6f2323"
+            border = "#35d07f" if ready else "#e05c5c"
+            status.setText(text)
+            status.setStyleSheet(f"padding: 6px; border: 1px solid {border}; background: {color};")
+
+        set_api_status(
+            "Nexus API key is configured." if key_input.text().strip() else "No Nexus API key configured.",
+            bool(key_input.text().strip()),
+        )
+
+        open_api = QPushButton("Open Nexus API Access")
+        save_key = QPushButton("Save API key")
+        validate_key = QPushButton("Validate API key")
+        clear_key = QPushButton("Clear")
+        close = QPushButton("Close")
+
+        def save() -> None:
+            updated = self._load_voice_config()
+            updated["nexusApiKey"] = key_input.text().strip()
+            self._save_voice_config(updated)
+            set_api_status(
+                "Nexus API key saved." if key_input.text().strip() else "Nexus API key removed.",
+                bool(key_input.text().strip()),
+            )
+
+        def validate() -> None:
+            api_key = key_input.text().strip()
+            if not api_key:
+                QMessageBox.information(dialog, PLUGIN_NAME, "Paste a Nexus API key first.")
+                return
+            try:
+                payload = validate_nexus_api_key(api_key, timeout=30.0)
+            except Exception as exc:
+                set_api_status("Nexus API key validation failed.", False)
+                QMessageBox.warning(dialog, PLUGIN_NAME, f"Nexus API key validation failed:\n\n{exc}")
+                return
+            name = str(payload.get("name") or payload.get("user_id") or "").strip()
+            set_api_status(f"Nexus API key validated{f' for {name}' if name else ''}.", True)
+
+        open_api.clicked.connect(lambda _checked=False: webbrowser.open("https://www.nexusmods.com/users/myaccount?tab=api"))
+        save_key.clicked.connect(lambda _checked=False: save())
+        validate_key.clicked.connect(lambda _checked=False: validate())
+        clear_key.clicked.connect(lambda _checked=False: (key_input.clear(), set_api_status("Key field cleared. Save to remove it from config.", False)))
+        close.clicked.connect(dialog.accept)
+
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("API key"))
+        key_row.addWidget(key_input, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(open_api)
+        buttons.addWidget(save_key)
+        buttons.addWidget(validate_key)
+        buttons.addWidget(clear_key)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(help_text)
+        layout.addWidget(image_label)
+        layout.addLayout(key_row)
+        layout.addWidget(status)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+        dialog.exec()
 
     def _fetch_sources(
         self,
@@ -4242,6 +5472,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             urls,
             cookies_path,
             config.get("falseMatches", []),
+            config.get("nexusApiKey") or "",
             timeout=UPDATE_REQUEST_TIMEOUT_SECONDS,
         )
         worker.moveToThread(thread)
@@ -4298,10 +5529,14 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         candidates_by_base = {}
         for candidate in candidates:
             base = candidate.get("base_internal_name") or candidate.get("base_mod") or ""
-            candidates_by_base.setdefault(base, []).append(candidate)
+            category = candidate.get("voice_category") or ""
+            candidates_by_base.setdefault((base, category), []).append(candidate)
 
         for row_index, row in enumerate(rows):
-            row_candidates = candidates_by_base.get(row.get("base_internal_name") or row.get("base_mod") or "")
+            row_candidates = candidates_by_base.get((
+                row.get("base_internal_name") or row.get("base_mod") or "",
+                row.get("voice_category") or "",
+            ))
             if not row_candidates:
                 continue
 
@@ -4321,9 +5556,11 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
                 "online_version": candidate.get("version") or "",
                 "online_candidates": row_candidates,
             })
-            if row.get("status") == "Missing":
+            if (row.get("slot_status") or row.get("status")) == "Missing":
+                row["slot_status"] = "Online found"
                 row["status"] = "Online found"
             self._fill_table_row(table, row_index, row)
+        self._refresh_voice_overviews(table)
 
     def _download_selected_candidate(
         self,
@@ -4382,6 +5619,8 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
                 "size": row.get("online_size") or "",
                 "date_iso": row.get("online_date_iso") or "",
                 "version": row.get("online_version") or "",
+                "voice_category": row.get("voice_category") or "",
+                "voice_category_label": row.get("voice_category_label") or "",
             }]
 
         candidates = sorted(
@@ -4398,8 +5637,8 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         dialog.resize(920, 500)
 
         table = QTableWidget(dialog)
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Score", "Candidate", "Size", "Date", "Source"])
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["Score", "Type", "Candidate", "Size", "Date", "Source"])
         table.setRowCount(len(candidates))
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -4410,6 +5649,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             score = int(candidate.get("online_score") or 0)
             for column, value in enumerate([
                 str(score or ""),
+                candidate.get("voice_category_label") or VOICE_CATEGORY_LABELS.get(candidate.get("voice_category") or "", candidate.get("voice_category") or ""),
                 candidate.get("download_name") or "",
                 candidate.get("size") or "",
                 candidate.get("date_iso") or "",
@@ -4424,13 +5664,14 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         table.selectRow(0)
 
-        title = QLabel(f"Base mod: {row.get('base_mod') or ''}")
+        title = QLabel(f"Base mod: {row.get('base_mod') or ''} | {row.get('voice_category_label') or ''}")
         title.setStyleSheet("font-weight: 700;")
         hint = QLabel("Select a candidate, then download. This window stays open and shows the download status.")
         hint.setWordWrap(True)
@@ -4487,11 +5728,6 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         main_download_button: QPushButton,
         main_fetch_button: QPushButton,
     ) -> None:
-        row = self._selected_row(main_table)
-        if not row:
-            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select the target base mod first.")
-            return
-
         downloads = list(getattr(main_table, "_ll_voice_all_downloads", []) or [])
         if not downloads:
             QMessageBox.information(
@@ -4501,43 +5737,137 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             )
             return
 
-        dialog = QDialog(parent)
-        dialog.setWindowTitle(f"All fetched voice downloads - {row.get('base_mod') or ''}")
-        dialog.resize(980, 540)
+        cache_key = self._all_source_downloads_cache_key(downloads)
+        cached = getattr(main_table, "_ll_voice_all_downloads_score_cache", None)
+        if isinstance(cached, dict) and cached.get("key") == cache_key:
+            scored_downloads = [dict(item) for item in cached.get("rows", [])]
+            dialog = QDialog(parent)
+            dialog.setWindowTitle("All fetched source downloads")
+            dialog.resize(1280, 760)
+            dialog.setMinimumSize(1040, 560)
+            title = QLabel("All fetched source downloads")
+            title.setStyleSheet("font-weight: 700;")
+            hint = QLabel("Each fetched archive is scored against all installed base mods. Filter or sort, then download using the best target shown in the row.")
+            hint.setWordWrap(True)
+            title.setMaximumHeight(22)
+            hint.setMaximumHeight(24)
+            hint.setStyleSheet("color: #c8c8c8;")
+            layout = QVBoxLayout(dialog)
+            dialog.setLayout(layout)
+        else:
+            dialog = QDialog(parent)
+            dialog.setWindowTitle("All fetched source downloads")
+            dialog.resize(1280, 760)
+            dialog.setMinimumSize(1040, 560)
+
+            title = QLabel("All fetched source downloads")
+            title.setStyleSheet("font-weight: 700;")
+            hint = QLabel("Each fetched archive is scored against all installed base mods. Filter or sort, then download using the best target shown in the row.")
+            hint.setWordWrap(True)
+            title.setMaximumHeight(22)
+            hint.setMaximumHeight(24)
+            hint.setStyleSheet("color: #c8c8c8;")
+            loading_label = QLabel("Preparing scored download list...")
+            loading_progress = QProgressBar(dialog)
+            loading_progress.setRange(0, max(1, len(downloads)))
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(6, 6, 6, 6)
+            layout.setSpacing(4)
+            layout.addWidget(title)
+            layout.addWidget(hint)
+            layout.addWidget(loading_label)
+            layout.addWidget(loading_progress)
+            dialog.setLayout(layout)
+            dialog.show()
+            QApplication.processEvents()
+
+            voice_rows = self._download_target_rows(list(getattr(main_table, "_ll_voice_rows", []) or []))
+            voice_inventory = self._collect_voice_mods_inventory(show_message=False)
+            downloaded_archives = self._downloaded_archive_names()
+            score_cache: dict[tuple[str, str], int] = {}
+            scored_downloads = []
+            for index, download in enumerate(downloads, start=1):
+                candidate = dict(download)
+                target, score = self._best_download_target(voice_rows, candidate, score_cache)
+                candidate["online_score"] = score
+                candidate["already_status"] = self._download_already_status(candidate, voice_inventory, downloaded_archives)
+                if target:
+                    candidate["target_base_mod"] = target.get("base_mod") or ""
+                    candidate["target_base_internal_name"] = target.get("base_internal_name") or ""
+                    candidate["target_voice_category"] = target.get("voice_category") or ""
+                    candidate["target_voice_category_label"] = target.get("voice_category_label") or ""
+                scored_downloads.append(candidate)
+                if index == len(downloads) or index % 25 == 0:
+                    loading_progress.setValue(index)
+                    loading_label.setText(f"Scoring source downloads... {index} / {len(downloads)}")
+                    QApplication.processEvents()
+            scored_downloads.sort(
+                key=lambda item: (
+                    -int(item.get("online_score") or 0),
+                    str(item.get("target_base_mod") or "").lower(),
+                    str(item.get("download_name") or "").lower(),
+                )
+            )
+            main_table._ll_voice_all_downloads_score_cache = {
+                "key": cache_key,
+                "rows": [dict(item) for item in scored_downloads],
+            }
+
+        if "voice_rows" not in locals():
+            voice_rows = self._download_target_rows(list(getattr(main_table, "_ll_voice_rows", []) or []))
+
+        if "voice_inventory" not in locals():
+            voice_inventory = self._collect_voice_mods_inventory(show_message=False)
 
         table = QTableWidget(dialog)
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Score", "Download", "Size", "Date", "Source"])
-        table.setRowCount(len(downloads))
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Base mods", "Score", "Target online to download", "State"])
+        table.setRowCount(len(scored_downloads))
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        table.setAlternatingRowColors(True)
-        table._ll_voice_candidates = downloads
+        table._ll_voice_candidates = scored_downloads
 
-        for index, download in enumerate(downloads):
-            score = voice_match_score(row.get("base_mod") or "", download.get("download_name") or "")
-            download["online_score"] = score
+        table.verticalHeader().setDefaultSectionSize(22)
+        table.verticalHeader().setMinimumSectionSize(18)
+        table.horizontalHeader().setMinimumSectionSize(70)
+        table.setAlternatingRowColors(True)
+
+        inventory_panel = self._build_voice_inventory_panel(dialog, voice_inventory)
+        inventory_panel.setMinimumWidth(280)
+        inventory_panel.setMaximumWidth(380)
+        
+        for index, download in enumerate(scored_downloads):
+            score = int(download.get("online_score") or 0)
             for column, value in enumerate([
+                download.get("target_base_mod") or "",
                 str(score or ""),
                 download.get("download_name") or "",
-                download.get("size") or "",
-                download.get("date_iso") or "",
-                download.get("source_url") or "",
+                download.get("already_status") or "Not found",
             ]):
                 item = QTableWidgetItem(str(value or ""))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip(str(value or ""))
+                item.setToolTip(self._source_download_tooltip(download))
                 item.setBackground(self._candidate_background_color(score))
                 item.setForeground(QColor(242, 242, 242))
                 table.setItem(index, column, item)
 
         header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionsMovable(False)
+        header.setStretchLastSection(False)
+
+        for column in range(table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+
+        default_widths = [380, 70, 360, 170]
+        for column, width in enumerate(default_widths):
+            table.setColumnWidth(column, width)
+
+        self._restore_all_fetch_table_widths(table)
+        
         table.selectRow(0)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(lambda pos: self._show_source_download_context_menu(table, pos))
 
         filter_text = QLineEdit(dialog)
         filter_text.setPlaceholderText("Filter download name / source / date")
@@ -4550,9 +5880,13 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             needle = filter_text.text().strip().lower()
             visible = 0
             first_visible = -1
-            for row_index, download in enumerate(downloads):
+            for row_index, download in enumerate(scored_downloads):
                 haystack = " ".join([
                     str(download.get("online_score") or ""),
+                    download.get("already_status") or "",
+                    download.get("target_base_mod") or "",
+                    download.get("target_voice_category_label") or "",
+                    VOICE_CATEGORY_LABELS.get(download.get("voice_category") or "", download.get("voice_category") or ""),
                     download.get("download_name") or "",
                     download.get("size") or "",
                     download.get("date_iso") or "",
@@ -4564,18 +5898,14 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
                     visible += 1
                     if first_visible < 0:
                         first_visible = row_index
-            count_label.setText(f"{visible} / {len(downloads)}")
+            count_label.setText(f"{visible} / {len(scored_downloads)}")
             selected = table.selectedItems()
             if first_visible >= 0 and (not selected or table.isRowHidden(selected[0].row())):
                 table.selectRow(first_visible)
 
         filter_text.textChanged.connect(lambda _text: apply_filter())
 
-        title = QLabel(f"Target base mod: {row.get('base_mod') or ''}")
-        title.setStyleSheet("font-weight: 700;")
-        hint = QLabel("This list contains every download found in your voice source URLs, even low/no-score files. Pick one manually for the selected base mod.")
-        hint.setWordWrap(True)
-        download_selected = QPushButton("Download selected for this mod")
+        download_selected = QPushButton("Download selected for best target")
         close = QPushButton("Close")
         close.clicked.connect(dialog.reject)
 
@@ -4588,9 +5918,17 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             if not downloads_path:
                 QMessageBox.warning(dialog, PLUGIN_NAME, "MO2 downloads path is not available.")
                 return
+            target = self._target_row_for_download(voice_rows, candidate)
+            if not target:
+                QMessageBox.information(
+                    dialog,
+                    PLUGIN_NAME,
+                    "No target mod was found for this download.\n\nUse the normal Choose / Download flow for a manually selected target.",
+                )
+                return
             self._start_online_candidate_download(
                 dialog,
-                row,
+                target,
                 candidate,
                 downloads_path,
                 status_label,
@@ -4605,25 +5943,275 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         table.itemDoubleClicked.connect(lambda _item: start_download())
 
         filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(4)
         filter_row.addWidget(QLabel("Filter"))
         filter_row.addWidget(filter_text, 1)
         filter_row.addWidget(count_label)
 
-        buttons = QHBoxLayout()
-        buttons.addWidget(download_selected)
-        buttons.addStretch(1)
-        buttons.addWidget(close)
+        while layout.count():
+            child = layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.setParent(None)
 
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(title)
-        layout.addWidget(hint)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal, dialog)
+        splitter.addWidget(table)
+        splitter.addWidget(inventory_panel)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+
+        self._restore_all_fetch_splitter_sizes(splitter)
+
+        status_label.setMaximumHeight(22)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(6)
+        bottom_row.addWidget(download_selected)
+        bottom_row.addWidget(status_label, 1)
+        bottom_row.addWidget(close)
+
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+        header_row.addWidget(title)
+        header_row.addWidget(hint, 1)
+
+        layout.addLayout(header_row)
         layout.addLayout(filter_row)
-        layout.addWidget(table)
-        layout.addWidget(status_label)
-        layout.addLayout(buttons)
-        dialog.setLayout(layout)
+        layout.addWidget(splitter, 1)
+        layout.addLayout(bottom_row)
+
         apply_filter()
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            self._save_all_fetch_table_widths(table)
+            self._save_all_fetch_splitter_sizes(splitter)
+
+    def _source_download_tooltip(self, item: dict) -> str:
+        return "\n".join([
+            f"Matched base mod: {item.get('target_base_mod') or ''}",
+            f"Score: {item.get('online_score') or ''}",
+            f"Target type: {item.get('target_voice_category_label') or ''}",
+            f"File type: {VOICE_CATEGORY_LABELS.get(item.get('voice_category') or '', item.get('voice_category') or '')}",
+            f"State: {item.get('already_status') or 'Not found'}",
+            f"Download: {item.get('download_name') or ''}",
+            f"Size: {item.get('size') or ''}",
+            f"Date: {item.get('date_iso') or ''}",
+            f"Source: {item.get('source_url') or ''}",
+        ]).strip()
+
+    def _show_source_download_context_menu(self, table: QTableWidget, pos) -> None:
+        item = table.itemAt(pos)
+        if item is None:
+            return
+        table.selectRow(item.row())
+        rows = getattr(table, "_ll_voice_candidates", [])
+        index = item.row()
+        if index < 0 or index >= len(rows):
+            return
+        download = rows[index]
+
+        menu = QMenu(table)
+        title = QAction(download.get("download_name") or "", menu)
+        title.setEnabled(False)
+        menu.addAction(title)
+        menu.addSeparator()
+        for label, value in [
+            ("Matched base mod", download.get("target_base_mod") or ""),
+            ("Score", download.get("online_score") or ""),
+            ("Target type", download.get("target_voice_category_label") or ""),
+            ("File type", VOICE_CATEGORY_LABELS.get(download.get("voice_category") or "", download.get("voice_category") or "")),
+            ("State", download.get("already_status") or "Not found"),
+            ("Size", download.get("size") or ""),
+            ("Date", download.get("date_iso") or ""),
+            ("Source", download.get("source_url") or ""),
+        ]:
+            action = QAction(f"{label}: {value}", menu)
+            action.setEnabled(False)
+            menu.addAction(action)
+        source_url = str(download.get("source_url") or "").strip()
+        if source_url:
+            menu.addSeparator()
+            open_source = QAction("Open source page", menu)
+            open_source.triggered.connect(lambda _checked=False, url=source_url: webbrowser.open(url))
+            menu.addAction(open_source)
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    def _download_target_rows(self, voice_rows: list[dict]) -> list[dict]:
+        rows = [dict(row) for row in voice_rows if not row.get("_overview_duplicate")]
+        seen = {
+            (
+                str(row.get("base_internal_name") or row.get("base_mod") or "").lower(),
+                str(row.get("voice_category") or ""),
+            )
+            for row in rows
+        }
+        config = self._load_voice_config()
+        forced_voice_mods = {str(value).lower() for value in config.get("forcedVoiceMods", [])}
+        forced_base_mods = {str(value).lower() for value in config.get("forcedBaseMods", [])}
+        try:
+            mod_list = self._organizer.modList() if self._organizer else None
+            internal_names = mod_list.allModsByProfilePriority() if mod_list else []
+        except Exception:
+            return rows
+        for internal_name in internal_names:
+            try:
+                display_name = mod_list.displayName(internal_name)
+            except Exception:
+                display_name = str(internal_name)
+            key = str(internal_name).lower()
+            auto_voice = voice_keyword_present(display_name)
+            is_voice = (auto_voice or key in forced_voice_mods) and key not in forced_base_mods
+            if is_voice:
+                continue
+            for category, category_label in VOICE_CATEGORIES:
+                row_key = (key, category)
+                if row_key in seen:
+                    continue
+                seen.add(row_key)
+                rows.append({
+                    "base_mod": display_name,
+                    "base_internal_name": internal_name,
+                    "voice_category": category,
+                    "voice_category_label": category_label,
+                    "slot_status": "",
+                    "status": "",
+                    "_synthetic_download_target": True,
+                })
+        return rows
+
+    def _all_source_downloads_cache_key(self, downloads: list[dict]) -> tuple:
+        config = self._load_voice_config()
+        forced = tuple(sorted(str(value).lower() for value in config.get("forcedVoiceMods", [])))
+        forced_base = tuple(sorted(str(value).lower() for value in config.get("forcedBaseMods", [])))
+        none_slots = tuple(sorted(str(value).lower() for value in config.get("noneVoiceSlots", [])))
+        complete_slots = tuple(sorted(str(value).lower() for value in config.get("completeVoiceSlots", [])))
+        archives = tuple(sorted(self._downloaded_archive_names()))
+        mods = []
+        try:
+            mod_list = self._organizer.modList() if self._organizer else None
+            internal_names = mod_list.allModsByProfilePriority() if mod_list else []
+            for internal_name in internal_names:
+                mods.append((str(internal_name), str(mod_list.displayName(internal_name))))
+        except Exception:
+            mods = []
+        source_rows = tuple(
+            (
+                str(item.get("download_name") or ""),
+                str(item.get("source_url") or ""),
+                str(item.get("size") or ""),
+                str(item.get("date_iso") or ""),
+                str(item.get("voice_category") or ""),
+            )
+            for item in downloads
+        )
+        return (source_rows, tuple(mods), forced, forced_base, none_slots, complete_slots, archives)
+
+    def _best_download_target(
+        self,
+        rows: list[dict],
+        download: dict,
+        score_cache: dict[tuple[str, str], int] | None = None,
+    ) -> tuple[dict | None, int]:
+        best_row = None
+        best_score = 0
+        for row in rows:
+            if row.get("_overview_duplicate"):
+                continue
+            slot_status = str(row.get("slot_status") or row.get("status") or "")
+            if slot_status in ("Ignored", "None"):
+                continue
+            score = self._download_target_score(row, download, score_cache)
+            if score > best_score:
+                best_score = score
+                best_row = row
+        return best_row, best_score
+
+    def _download_target_score(
+        self,
+        row: dict,
+        download: dict,
+        score_cache: dict[tuple[str, str], int] | None = None,
+    ) -> int:
+        base_name = str(row.get("base_mod") or "")
+        download_name = str(download.get("download_name") or "")
+        cache_key = (base_name, download_name)
+        if score_cache is not None and cache_key in score_cache:
+            score = score_cache[cache_key]
+        else:
+            score = voice_match_score(base_name, download_name)
+            if score_cache is not None:
+                score_cache[cache_key] = score
+        download_category = str(download.get("voice_category") or "")
+        row_category = str(row.get("voice_category") or "")
+        if download_category and row_category:
+            if download_category == row_category:
+                score += 20
+            else:
+                return 0
+        elif row_category:
+            score = max(0, score - 35)
+        return score
+
+    def _target_row_for_download(self, rows: list[dict], candidate: dict) -> dict | None:
+        base = str(candidate.get("target_base_internal_name") or candidate.get("target_base_mod") or "")
+        category = str(candidate.get("target_voice_category") or "")
+        if not base or not category:
+            return None
+        for row in rows:
+            row_base = str(row.get("base_internal_name") or row.get("base_mod") or "")
+            if row_base == base and str(row.get("voice_category") or "") == category:
+                return row
+        return None
+
+    def _downloaded_archive_names(self) -> set[str]:
+        downloads_path = self._mo2_downloads_path()
+        if not downloads_path or not downloads_path.exists():
+            return set()
+        try:
+            return {path.name.lower() for path in downloads_path.iterdir() if path.is_file()}
+        except Exception:
+            return set()
+
+    def _download_already_status(self, candidate: dict, voice_mods: list[dict], archive_names: set[str]) -> str:
+        download_name = str(candidate.get("download_name") or "").strip()
+        if not download_name:
+            return ""
+        archive_name = safe_archive_name(download_name).lower()
+        if archive_name in archive_names:
+            return "Downloaded"
+
+        best_installed = None
+        best_installed_score = 0
+        for voice in voice_mods:
+            score = voice_match_score(voice.get("display_name") or "", download_name)
+            if score > best_installed_score:
+                best_installed_score = score
+                best_installed = voice
+        if best_installed and best_installed_score >= 90:
+            return f"Installed: {best_installed.get('display_name') or ''}"
+
+        best_archive = ""
+        best_archive_score = 0
+        for archive in archive_names:
+            if not archive.endswith((".7z", ".zip", ".rar")):
+                continue
+            score = voice_match_score(archive, download_name)
+            if score > best_archive_score:
+                best_archive_score = score
+                best_archive = archive
+        if best_archive and best_archive_score >= 95:
+            return f"Downloaded: {best_archive}"
+        return ""
 
     def _hide_selected_online_match(self, dialog: QDialog, table: QTableWidget, row: dict) -> None:
         candidate = self._candidate_from_online_table(table)
@@ -4633,6 +6221,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
 
         item = {
             "base": str(row.get("base_internal_name") or row.get("base_mod") or "").lower(),
+            "voice_category": str(row.get("voice_category") or "").lower(),
             "candidate": str(candidate.get("download_name") or "").lower(),
             "source_url": str(candidate.get("source_url") or "").lower(),
         }
@@ -4645,6 +6234,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             PLUGIN_NAME,
             "Hide this online candidate from future source fetches?\n\n"
             f"Base: {row.get('base_mod') or ''}\n"
+            f"Voice type: {row.get('voice_category_label') or ''}\n"
             f"Candidate: {candidate.get('download_name') or ''}\n\n"
             "You can restore it later with the False matches button.",
         )
@@ -4680,10 +6270,12 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         main_fetch_button: QPushButton,
     ) -> None:
         candidate = {
+            **candidate,
             "base_mod": row.get("base_mod") or "",
             "base_internal_name": row.get("base_internal_name") or "",
             "base_page_url": row.get("base_page_url") or "",
-            **candidate,
+            "voice_category": row.get("voice_category") or candidate.get("voice_category") or "",
+            "voice_category_label": row.get("voice_category_label") or candidate.get("voice_category_label") or "",
         }
 
         thread = QThread(dialog)
@@ -4906,6 +6498,7 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             PLUGIN_NAME,
             "Hide this candidate from future voice scans?\n\n"
             f"Base: {row.get('base_mod') or ''}\n"
+            f"Voice type: {row.get('voice_category_label') or ''}\n"
             f"Candidate: {candidate}\n\n"
             "This only affects installed/local voice matching. You can restore it later with the False matches button.",
         )
@@ -4915,13 +6508,14 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         config = self._load_voice_config()
         item = {
             "base": str(row.get("base_internal_name") or row.get("base_mod") or "").lower(),
+            "voice_category": str(row.get("voice_category") or "").lower(),
             "candidate": str(candidate).lower(),
             "source_url": str(source_url).lower(),
         }
         if item not in config["falseMatches"]:
             config["falseMatches"].append(item)
         manual_matches = dict(config.get("manualVoiceMatches") or {})
-        manual_matches.pop(item["base"], None)
+        manual_matches.pop(str(row.get("slot_key") or "").lower(), None)
         config["manualVoiceMatches"] = manual_matches
         self._save_voice_config(config)
 
@@ -4934,8 +6528,9 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             row["installed_voice_internal_name"] = ""
             row["score"] = 0
             row["manual_voice"] = False
+            row["slot_status"] = "Missing"
             row["status"] = "Missing"
-        self._fill_table_row(table, self._selected_table_index(table), row)
+        self._refresh_voice_overviews(table)
         self._apply_filter(table, filter_mode, filter_text, count_label)
 
     def _manage_false_matches(
@@ -4960,7 +6555,11 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
             base = item.get("base") or ""
             candidate = item.get("candidate") or ""
             source_url = item.get("source_url") or ""
-            label = f"{base} -> {candidate}"
+            category = item.get("voice_category") or ""
+            label = f"{base}"
+            if category:
+                label = f"{label} [{VOICE_CATEGORY_LABELS.get(category, category)}]"
+            label = f"{label} -> {candidate}"
             if source_url:
                 label = f"{label} | {source_url}"
             items.addItem(label)
@@ -4998,6 +6597,20 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         dialog.setLayout(layout)
         dialog.exec()
 
+    def _toggle_complete_slot(
+        self,
+        table: QTableWidget,
+        filter_mode: QComboBox,
+        filter_text: QLineEdit,
+        count_label: QLabel,
+    ) -> None:
+        row = self._selected_row(table)
+        if not row:
+            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "Select a row first.")
+            return
+        mode = "reopen" if (row.get("slot_status") or row.get("status")) in ("Complete", "None") else "complete"
+        self._set_slot_flag(table, row, mode, filter_mode, filter_text, count_label)
+
     def _toggle_ignore(
         self,
         table: QTableWidget,
@@ -5015,15 +6628,23 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         ignored = {str(value).lower() for value in config.get("ignoredBaseMods", [])}
         if key in ignored:
             ignored.remove(key)
-            row["status"] = "Installed" if int(row.get("score") or 0) >= 90 else "Possible" if int(row.get("score") or 0) >= 55 else "Missing"
-            if row.get("online_candidate") and row["status"] == "Missing":
-                row["status"] = "Online found"
+            row["slot_status"] = self._voice_row_status(
+                False,
+                bool(row.get("complete_voice")),
+                bool(row.get("none_voice")),
+                bool(row.get("manual_voice")),
+                int(row.get("score") or 0),
+                bool(row.get("online_candidate")),
+                self._local_match_threshold(config),
+            )
+            row["status"] = row["slot_status"]
         else:
             ignored.add(key)
+            row["slot_status"] = "Ignored"
             row["status"] = "Ignored"
         config["ignoredBaseMods"] = sorted(ignored)
         self._save_voice_config(config)
-        self._fill_table_row(table, self._selected_table_index(table), row)
+        self._refresh_voice_overviews(table)
         self._apply_filter(table, filter_mode, filter_text, count_label)
 
     def _classify_selected_mod(
@@ -5096,9 +6717,30 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         self._apply_filter(table, filter_mode, filter_text, count_label)
 
     def _show_voice_mods_inventory(self, parent: QDialog) -> None:
-        if not self._organizer:
-            QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "MO2 organizer is not available.")
+        voice_mods = self._collect_voice_mods_inventory(show_message=True)
+
+        if not voice_mods:
             return
+
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Installed voice mods")
+        dialog.resize(940, 520)
+
+        panel = self._build_voice_inventory_panel(dialog, voice_mods)
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(panel)
+        layout.addWidget(close)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def _collect_voice_mods_inventory(self, show_message: bool = True) -> list[dict]:
+        if not self._organizer:
+            if show_message:
+                QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "MO2 organizer is not available.")
+            return []
 
         config = self._load_voice_config()
         forced_voice_mods = {str(value).lower() for value in config.get("forcedVoiceMods", [])}
@@ -5126,28 +6768,28 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
                 "classification": "Forced voice" if key in forced_voice_mods else "Auto voice",
             })
 
-        if not voice_mods:
+        if show_message and not voice_mods:
             QMessageBox.information(self._parentWidget(), PLUGIN_NAME, "No installed voice-like mods were found.")
-            return
+        return voice_mods
 
-        dialog = QDialog(parent)
-        dialog.setWindowTitle("Installed voice mods")
-        dialog.resize(940, 520)
-
-        table = QTableWidget(dialog)
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Voice mod", "Installed", "Class", "Internal", "Folder"])
+    def _build_voice_inventory_panel(self, parent: QDialog, voice_mods: list[dict]):
+        panel = QDialog(parent)
+        panel.setWindowFlags(Qt.WindowType.Widget)
+        table = QTableWidget(panel)
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Voice mod", "Installed"])
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setAlternatingRowColors(True)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         table._ll_voice_inventory = voice_mods
 
-        filter_text = QLineEdit(dialog)
+        filter_text = QLineEdit(panel)
         filter_text.setPlaceholderText("Filter voice mod / folder")
         filter_text.setClearButtonEnabled(True)
-        sort_mode = QComboBox(dialog)
+        sort_mode = QComboBox(panel)
         sort_mode.addItems(["Name A-Z", "Name Z-A", "Newest first", "Oldest first"])
-        count_label = QLabel(dialog)
+        count_label = QLabel(panel)
 
         def populate() -> None:
             needle = filter_text.text().strip().lower()
@@ -5176,13 +6818,10 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
                 for column, value in enumerate([
                     item.get("display_name") or "",
                     item.get("installed_at") or "",
-                    item.get("classification") or "",
-                    item.get("internal_name") or "",
-                    item.get("mod_path") or "",
                 ]):
                     cell = QTableWidgetItem(str(value or ""))
                     cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    cell.setToolTip(str(value or ""))
+                    cell.setToolTip(self._voice_inventory_tooltip(item))
                     table.setItem(row_index, column, cell)
             count_label.setText(f"{len(rows)} / {len(voice_mods)}")
             if rows:
@@ -5203,18 +6842,14 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         filter_text.textChanged.connect(lambda _text: populate())
         sort_mode.currentTextChanged.connect(lambda _text: populate())
         table.itemDoubleClicked.connect(lambda _item: open_selected())
+        table.customContextMenuRequested.connect(lambda pos: self._show_voice_inventory_context_menu(table, pos))
 
         open_folder = QPushButton("Open selected folder")
         open_folder.clicked.connect(lambda _checked=False: open_selected())
-        close = QPushButton("Close")
-        close.clicked.connect(dialog.accept)
 
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Filter"))
@@ -5226,15 +6861,58 @@ class LoversLabVoiceFinderTool(LoversLabBaseTool):
         buttons = QHBoxLayout()
         buttons.addWidget(open_folder)
         buttons.addStretch(1)
-        buttons.addWidget(close)
 
-        layout = QVBoxLayout(dialog)
+        layout = QVBoxLayout(panel)
+        title = QLabel("Installed voice mods")
+        title.setStyleSheet("font-weight: 700;")
+        layout.addWidget(title)
         layout.addLayout(controls)
         layout.addWidget(table)
         layout.addLayout(buttons)
-        dialog.setLayout(layout)
+        panel.setLayout(layout)
         populate()
-        dialog.exec()
+        return panel
+
+    def _voice_inventory_tooltip(self, item: dict) -> str:
+        return "\n".join([
+            item.get("display_name") or "",
+            f"Installed: {item.get('installed_at') or ''}",
+            f"Class: {item.get('classification') or ''}",
+            f"Internal: {item.get('internal_name') or ''}",
+            f"Folder: {item.get('mod_path') or ''}",
+        ]).strip()
+
+    def _show_voice_inventory_context_menu(self, table: QTableWidget, pos) -> None:
+        selected = table.selectedItems()
+        rows = getattr(table, "_ll_voice_inventory_visible", [])
+        item = table.itemAt(pos)
+        if item is None:
+            return
+        table.selectRow(item.row())
+        index = item.row()
+        if index < 0 or index >= len(rows):
+            return
+        voice = rows[index]
+
+        menu = QMenu(table)
+        title = QAction(voice.get("display_name") or "", menu)
+        title.setEnabled(False)
+        menu.addAction(title)
+        menu.addSeparator()
+        for label, value in [
+            ("Installed", voice.get("installed_at") or ""),
+            ("Class", voice.get("classification") or ""),
+            ("Internal", voice.get("internal_name") or ""),
+            ("Folder", voice.get("mod_path") or ""),
+        ]:
+            action = QAction(f"{label}: {value}", menu)
+            action.setEnabled(False)
+            menu.addAction(action)
+        menu.addSeparator()
+        open_folder = QAction("Open folder", menu)
+        open_folder.triggered.connect(lambda _checked=False, path=voice.get("mod_path") or "": self._open_path(Path(path)) if path and Path(path).exists() else None)
+        menu.addAction(open_folder)
+        menu.exec(table.viewport().mapToGlobal(pos))
 
     def _selected_table_index(self, table: QTableWidget) -> int:
         selected = table.selectedItems()

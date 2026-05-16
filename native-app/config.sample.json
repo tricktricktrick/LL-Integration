@@ -1,7 +1,12 @@
 {
   "mo2_path": "C:\\Path\\To\\MO2\\ModOrganizer.exe",
   "mo2_downloads_path": "C:\\Path\\To\\MO2\\downloads",
+  "vortex_downloads_path": "C:\\Path\\To\\Vortex\\downloads\\skyrimse",
+  "vortex_staging_path": "C:\\Path\\To\\Vortex Mods\\skyrimse",
+  "vortex_state_path": "C:\\Users\\You\\AppData\\Local\\LLIntegration\\native-app\\vortex_state.json",
+  "active_downloads_target": "mo2",
   "metadata_path": "%LOCALAPPDATA%\\LLIntegration\\metadata",
   "copy_archives_to_mo2_downloads": true,
+  "copy_archives_to_vortex_downloads": true,
   "overwrite_existing_downloads": true
 }

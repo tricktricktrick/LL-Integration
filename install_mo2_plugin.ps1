@@ -36,6 +36,13 @@ if (Test-Path -LiteralPath $iconsSource) {
     Copy-Item -Path (Join-Path $iconsSource "*") -Destination $iconsTarget -Force
 }
 
+$tutorialSource = Join-Path $root "Mo2_ImageTutorial"
+$tutorialTarget = Join-Path $target "Mo2_ImageTutorial"
+if (Test-Path -LiteralPath $tutorialSource) {
+    New-Item -ItemType Directory -Force -Path $tutorialTarget | Out-Null
+    Copy-Item -Path (Join-Path $tutorialSource "*") -Destination $tutorialTarget -Force
+}
+
 $experimentalSource = Join-Path $source "experimental"
 $experimentalTarget = Join-Path $target "experimental"
 if ($WithToolbar -and (Test-Path -LiteralPath $experimentalSource)) {
